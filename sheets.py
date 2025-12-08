@@ -13,7 +13,7 @@ TRANSCRIPTIONS_SHEET = "DailyTranscriptions"
 
 
 def _get_sheets_service():
-    """Create an authorized Google Sheets API client from env JSON."""
+    """Internal helper to create an authorized Google Sheets API client."""
     json_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not json_str:
         raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable is missing.")
@@ -23,28 +23,48 @@ def _get_sheets_service():
         cred_info,
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
-    service = build("sheets", "v4", credentials=creds)
-    return service
+    return build("sheets", "v4", credentials=creds)
 
 
-def add_subscriber(full_name: str, email: str, cell_number: str, testing_center: str):
+# --- PUBLIC WRAPPER (app.py imports this) ---
+def get_sheets_service():
+    """Expose the underlying Sheets service for app.py."""
+    return _get_sheets_service()
+
+
+# --- PUBLIC WRAPPER (app.py expects this name) ---
+def append_row_to_sheet(sheet_name: str, row_values: list):
     """
-    Append a subscriber row to the Subscribers sheet.
-    Columns: full_name | email | cell_number | testing_center
+    Generic row append function used by app.py.
+    This allows app.py to push any row to any sheet.
     """
     if not SPREADSHEET_ID:
         raise ValueError("GOOGLE_SHEET_ID environment variable is missing.")
 
     service = _get_sheets_service()
     sheet = service.spreadsheets()
-    row = [[full_name, email, cell_number, testing_center]]
 
     sheet.values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SUBSCRIBERS_SHEET}!A:D",
+        range=f"{sheet_name}!A:Z",
         valueInputOption="USER_ENTERED",
-        body={"values": row},
+        body={"values": [row_values]},
     ).execute()
+
+
+# ---------------------------------------------------------------------
+#             SUBSCRIBER MANAGEMENT FUNCTIONS
+# ---------------------------------------------------------------------
+
+def add_subscriber(full_name: str, email: str, cell_number: str, testing_center: str):
+    """
+    Append a subscriber row to the Subscribers sheet.
+    Columns: full_name | email | cell_number | testing_center
+    """
+    append_row_to_sheet(
+        SUBSCRIBERS_SHEET,
+        [full_name, email, cell_number, testing_center],
+    )
 
 
 def get_all_subscribers():
@@ -63,12 +83,13 @@ def get_all_subscribers():
         range=f"{SUBSCRIBERS_SHEET}!A:D",
     ).execute()
 
-    values = result.get("values", [])
+    values = result.get("values", []) or []
     subscribers = []
+
     for row in values:
-        # pad row to length 4
         while len(row) < 4:
             row.append("")
+
         subscribers.append(
             {
                 "full_name": row[0],
@@ -80,51 +101,11 @@ def get_all_subscribers():
     return subscribers
 
 
+# ---------------------------------------------------------------------
+#             DAILY TRANSCRIPTION FUNCTIONS
+# ---------------------------------------------------------------------
+
 def save_daily_transcription(transcription_text: str, date_str: str | None = None):
     """
     Append a transcription row to DailyTranscriptions.
-    Columns: date (YYYY-MM-DD) | transcription_text
-    """
-    if not SPREADSHEET_ID:
-        raise ValueError("GOOGLE_SHEET_ID environment variable is missing.")
-
-    if not date_str:
-        date_str = datetime.utcnow().strftime("%Y-%m-%d")
-
-    service = _get_sheets_service()
-    sheet = service.spreadsheets()
-    row = [[date_str, transcription_text]]
-
-    sheet.values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{TRANSCRIPTIONS_SHEET}!A:B",
-        valueInputOption="USER_ENTERED",
-        body={"values": row},
-    ).execute()
-
-
-def get_latest_transcription():
-    """
-    Return (date_str, transcription_text) for the last row in DailyTranscriptions,
-    or (None, None) if there are no rows.
-    """
-    if not SPREADSHEET_ID:
-        raise ValueError("GOOGLE_SHEET_ID environment variable is missing.")
-
-    service = _get_sheets_service()
-    sheet = service.spreadsheets()
-
-    result = sheet.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{TRANSCRIPTIONS_SHEET}!A:B",
-    ).execute()
-
-    values = result.get("values", [])
-    if not values:
-        return None, None
-
-    last = values[-1]
-    while len(last) < 2:
-        last.append("")
-
-    return last[0], last[1]
+    Columns: date (YYYY-MM-DD) | tran
