@@ -5,7 +5,6 @@ from datetime import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# Spreadsheet ID comes from an environment variable
 SPREADSHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 
 SUBSCRIBERS_SHEET = "Subscribers"
