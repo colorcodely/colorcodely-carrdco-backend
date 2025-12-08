@@ -2,10 +2,9 @@ import os
 from datetime import datetime
 
 from flask import Flask, request, jsonify, Response
-
 from twilio.rest import Client
 
-from sheets import append_row_to_sheet, get_sheets_service
+from sheets import add_subscriber, get_all_subscribers, save_daily_transcription
 from sms import send_sms
 from emailer import send_email
 
@@ -29,90 +28,18 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 HUNTSVILLE_COLOR_LINE = "+12564277808"
 
 # In-memory cache of the latest announcement text
-# (Good enough for MVP; later you can persist this in Sheets if you want.)
 LATEST_ANNOUNCEMENT_TEXT = None
 
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Helper to safely pull fields from Carrd form
 # -----------------------------------------------------------------------------
 def get_form_field(data, *keys):
-    """Safely pull the first non-empty value from a set of possible form keys."""
+    """Return the first non-empty field among the given keys."""
     for key in keys:
-        if key in data and data[key].strip():
+        if key in data and isinstance(data[key], str) and data[key].strip():
             return data[key].strip()
     return ""
-
-
-def get_all_subscribers():
-    """
-    Read all subscriber rows from Sheet1.
-
-    Expected columns per row:
-        A: timestamp
-        B: full_name
-        C: email
-        D: phone
-        E: testing_center
-    """
-    subscribers = []
-    try:
-        service = get_sheets_service()
-        result = (
-            service.spreadsheets()
-            .values()
-            .get(spreadsheetId=SPREADSHEET_ID, range="Sheet1!A1:E")
-            .execute()
-        )
-        values = result.get("values", [])
-        for row in values:
-            # Skip rows that don't have at least email & phone
-            if len(row) < 4:
-                continue
-            subscribers.append(
-                {
-                    "timestamp": row[0] if len(row) > 0 else "",
-                    "name": row[1] if len(row) > 1 else "",
-                    "email": row[2] if len(row) > 2 else "",
-                    "phone": row[3] if len(row) > 3 else "",
-                    "testing_center": row[4] if len(row) > 4 else "",
-                }
-            )
-    except Exception as e:
-        app.logger.exception("Error loading subscribers from sheet: %s", e)
-
-    return subscribers
-
-
-def log_transcription_to_sheet(call_sid, recording_url, transcription_text):
-    """
-    Log today's transcription in the same spreadsheet in a tab called 'Transcriptions'.
-    (You can create this tab manually in Google Sheets if it doesn't exist yet.)
-    Columns:
-        A: timestamp (UTC ISO)
-        B: Call SID
-        C: Recording URL
-        D: Transcription text
-    """
-    try:
-        service = get_sheets_service()
-        now = datetime.utcnow().isoformat()
-        body = {
-            "values": [[now, call_sid or "", recording_url or "", transcription_text]]
-        }
-        (
-            service.spreadsheets()
-            .values()
-            .append(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Transcriptions!A1",
-                valueInputOption="USER_ENTERED",
-                body=body,
-            )
-            .execute()
-        )
-    except Exception as e:
-        app.logger.exception("Failed to log transcription to sheet: %s", e)
 
 
 # -----------------------------------------------------------------------------
@@ -125,8 +52,8 @@ def health():
 
 # -----------------------------------------------------------------------------
 # Carrd form submit endpoint
-#   - Called by your Carrd "Send to URL" form (POST)
-#   - Saves subscriber to Sheets
+#   - Called by Carrd "Send to URL" form (POST)
+#   - Saves subscriber to Google Sheets
 #   - Sends welcome SMS + email
 #   - If we already have today's announcement, include it
 # -----------------------------------------------------------------------------
@@ -152,14 +79,11 @@ def submit():
             400,
         )
 
-    timestamp = datetime.utcnow().isoformat()
-
-    # Append the subscriber row to Sheet1
+    # Store subscriber in the Subscribers sheet
     try:
-        row = [timestamp, full_name, email, phone, testing_center]
-        append_row_to_sheet(SPREADSHEET_ID, row)
+        add_subscriber(full_name, email, phone, testing_center)
     except Exception as e:
-        app.logger.exception("Failed to append subscriber row: %s", e)
+        app.logger.exception("Failed to add subscriber: %s", e)
 
     # Build welcome messages
     if LATEST_ANNOUNCEMENT_TEXT:
@@ -208,7 +132,7 @@ def submit():
 
 
 # -----------------------------------------------------------------------------
-# TwiML endpoint used for the outbound daily call
+# TwiML endpoint for outbound daily call
 #   Twilio hits this when we start the call from /daily-call.
 #   It tells Twilio: dial the Huntsville line and record the call.
 # -----------------------------------------------------------------------------
@@ -232,18 +156,18 @@ def twiml_dial_color_line():
 # -----------------------------------------------------------------------------
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
-    try:
-        if not APP_BASE_URL:
-            return (
-                jsonify(
-                    {
-                        "status": "error",
-                        "message": "APP_BASE_URL is not set in environment variables.",
-                    }
-                ),
-                500,
-            )
+    if not APP_BASE_URL:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "APP_BASE_URL is not set in environment variables.",
+                }
+            ),
+            500,
+        )
 
+    try:
         twiml_url = f"{APP_BASE_URL}/twiml/dial_color_line"
         callback_url = f"{APP_BASE_URL}/twilio/recording-complete"
 
@@ -263,11 +187,11 @@ def daily_call():
 
 
 # -----------------------------------------------------------------------------
-# Twilio Recording / Transcription callback
+# Twilio recording/transcription callback
 #   - Twilio calls this after the recorded call is complete.
-#   - We grab TranscriptionText if available (or at least RecordingUrl),
-#     log it to Sheets, update LATEST_ANNOUNCEMENT_TEXT,
-#     then SMS + email all subscribers.
+#   - We grab TranscriptionText if available (or fallback),
+#     save it in DailyTranscriptions, update in-memory latest text,
+#     and SMS+email all subscribers.
 # -----------------------------------------------------------------------------
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
@@ -280,21 +204,26 @@ def recording_complete():
     transcription_text = form.get("TranscriptionText")
 
     if not transcription_text:
-        # Fallback if Twilio didn't provide transcription text
         transcription_text = (
-            "No transcription text was provided by Twilio "
-            "(you may need to enable transcription for your account "
-            "or process the recording manually)."
+            "No transcription text was provided by Twilio. "
+            "You may need to enable or configure transcription for recordings."
         )
 
     # Update in-memory latest announcement
     LATEST_ANNOUNCEMENT_TEXT = transcription_text
 
-    # Log this transcription in Sheets (Transcriptions tab)
-    log_transcription_to_sheet(call_sid, recording_url, transcription_text)
+    # Save to the DailyTranscriptions sheet (date + text)
+    try:
+        save_daily_transcription(transcription_text)
+    except Exception as e:
+        app.logger.exception("Failed to save daily transcription: %s", e)
 
-    # Load all subscribers from Sheet1
-    subscribers = get_all_subscribers()
+    # Load all subscribers
+    try:
+        subscribers = get_all_subscribers()
+    except Exception as e:
+        app.logger.exception("Failed to load subscribers: %s", e)
+        subscribers = []
 
     sms_body = f"Today's color code announcement:\n\n{transcription_text}"
     email_subject = "Today's ColorCodely announcement"
@@ -306,9 +235,9 @@ def recording_complete():
     )
 
     for sub in subscribers:
-        phone = sub.get("phone")
+        phone = sub.get("cell_number")
         email = sub.get("email")
-        name = sub.get("name") or "there"
+        name = sub.get("full_name") or "there"
 
         # SMS
         if phone:
@@ -330,7 +259,7 @@ def recording_complete():
 
 
 # -----------------------------------------------------------------------------
-# Main entrypoint (for local testing, not used on Render with gunicorn)
+# Main entrypoint (for local testing)
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
