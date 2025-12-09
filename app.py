@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+from threading import Thread
 
 from flask import Flask, request, jsonify, Response
 from twilio.rest import Client
@@ -27,7 +28,7 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 # City of Huntsville, AL Municipal Court Probation Office color code line
 HUNTSVILLE_COLOR_LINE = "+12564277808"
 
-# Last known good announcement text (for possible future use)
+# Last known good announcement text (for welcome messages, etc.)
 LATEST_ANNOUNCEMENT_TEXT = None
 
 # Tracks whether we've already sent a "not updated yet" notice today
@@ -111,11 +112,10 @@ def submit():
     """
     Carrd form submit endpoint.
 
-    Behavior (your choice B):
-    - Save subscriber to Google Sheets.
-    - Do NOT send SMS or email immediately.
-    - Optionally trigger a call once if we have never fetched an announcement yet.
-    - Return quickly so Render does not time out.
+    - Saves subscriber to Google Sheets
+    - If we **already** have a latest announcement, sends it in the welcome SMS/email
+    - If we **don't** have any announcement yet, triggers a call once and tells them
+      they'll get the first announcement as soon as it's available.
     """
     global LATEST_ANNOUNCEMENT_TEXT
 
@@ -137,23 +137,62 @@ def submit():
             400,
         )
 
-    # 1) Save to Google Sheets (one quick API call)
+    # 1) Save to Google Sheets
     try:
         add_subscriber(full_name, email, phone, testing_center)
     except Exception as e:
         app.logger.exception("Failed to add subscriber: %s", e)
-        # Still return OK so Carrd shows success; we just log the error.
-        # You can change this to return 500 if you'd rather show an error.
 
-    # 2) If we have NEVER seen an announcement yet, optionally kick off
-    #    an initial call. This is a single Twilio API call and should be fast.
+    # 2) Decide what to send based on whether we have any announcement yet
     if LATEST_ANNOUNCEMENT_TEXT is None:
+        # Option A: First-ever signup or fresh system — trigger a call once
         try:
             start_color_line_call()
         except Exception as e:
             app.logger.exception("Failed to trigger initial call from submit: %s", e)
 
-    # 3) Return immediately so the browser / Carrd does not wait on Twilio/Emails
+        sms_body = (
+            "Welcome to ColorCodely alerts!\n\n"
+            "You’re subscribed. We’ve started a call to fetch the latest "
+            "color code announcement and you’ll receive it as soon as it’s available."
+        )
+        email_subject = "Welcome to ColorCodely alerts"
+        email_body = (
+            f"Hi {full_name or ''},\n\n"
+            "Thanks for subscribing to ColorCodely.\n\n"
+            "We’re fetching the latest color code announcement now. "
+            "You’ll start receiving daily announcements by text and email "
+            "as soon as the first recording is processed.\n\n"
+            "— ColorCodely"
+        )
+    else:
+        # We already have a recent announcement — send it right away
+        sms_body = (
+            "Welcome to ColorCodely alerts!\n\n"
+            "Here is the most recent color code announcement:\n\n"
+            f"{LATEST_ANNOUNCEMENT_TEXT}"
+        )
+        email_subject = "Welcome to ColorCodely – Latest Announcement"
+        email_body = (
+            f"Hi {full_name or ''},\n\n"
+            "You're now subscribed to ColorCodely daily alerts.\n\n"
+            "Here is the most recent color code announcement:\n\n"
+            f"{LATEST_ANNOUNCEMENT_TEXT}\n\n"
+            "You'll continue receiving new announcements automatically each day.\n\n"
+            "— ColorCodely"
+        )
+
+    # 3) Send welcome SMS + email
+    try:
+        send_sms(phone, sms_body)
+    except Exception as e:
+        app.logger.exception("Failed to send welcome SMS to %s: %s", phone, e)
+
+    try:
+        send_email(email, email_subject, email_body)
+    except Exception as e:
+        app.logger.exception("Failed to send welcome email to %s: %s", email, e)
+
     return jsonify({"status": "ok"})
 
 
@@ -195,33 +234,12 @@ def daily_call():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route("/twilio/recording-complete", methods=["POST"])
-def recording_complete():
+def _process_transcription(transcription_text: str):
     """
-    Twilio recording/transcription callback.
-
-    Behavior:
-    - If the transcription is the SAME as the latest saved one:
-        -> Do NOT send yesterday's colors again
-        -> Send a one-time "recording not updated yet" SMS/email for today
-    - If the transcription is NEW:
-        -> Save it to Google Sheets
-        -> Update LATEST_ANNOUNCEMENT_TEXT
-        -> Send today's announcement to all subscribers
+    Runs in a background thread so we can return 204 to Twilio immediately.
+    Does ALL the heavy work: Sheets + notifying subscribers.
     """
     global LATEST_ANNOUNCEMENT_TEXT, NOT_UPDATED_NOTICE_SENT_DATE
-
-    form = request.form
-
-    transcription_text = form.get("TranscriptionText")
-    if not transcription_text:
-        transcription_text = (
-            "No transcription text was provided by Twilio. "
-            "You may need to enable or configure transcription for recordings."
-        )
-    else:
-        # Clean up potential repeated loops from the IVR
-        transcription_text = clean_transcription_text(transcription_text)
 
     # 1) Compare with the last saved transcription in Sheets
     try:
@@ -247,7 +265,7 @@ def recording_complete():
 
         # Only send the "not updated yet" notice once per day
         if NOT_UPDATED_NOTICE_SENT_DATE == today_str:
-            return ("", 204)
+            return
 
         NOT_UPDATED_NOTICE_SENT_DATE = today_str
 
@@ -289,7 +307,7 @@ def recording_complete():
                         "Failed to send 'not updated' email to %s: %s", email, e
                     )
 
-        return ("", 204)
+        return
 
     # 4) At this point, we have a **new** transcription 🎉
     LATEST_ANNOUNCEMENT_TEXT = transcription_text
@@ -328,6 +346,33 @@ def recording_complete():
                 send_email(email, email_subject, body)
             except Exception as e:
                 app.logger.exception("Failed to send daily email to %s: %s", email, e)
+
+
+@app.route("/twilio/recording-complete", methods=["POST"])
+def recording_complete():
+    """
+    Twilio recording/transcription callback.
+
+    NOW:
+      - Parse + clean transcription
+      - Spawn background thread to do heavy work
+      - Immediately return 204 so Twilio doesn't time out
+    """
+    form = request.form
+
+    transcription_text = form.get("TranscriptionText")
+    if not transcription_text:
+        transcription_text = (
+            "No transcription text was provided by Twilio. "
+            "You may need to enable or configure transcription for recordings."
+        )
+    else:
+        transcription_text = clean_transcription_text(transcription_text)
+
+    # Kick off background processing and return right away
+    t = Thread(target=_process_transcription, args=(transcription_text,))
+    t.daemon = True
+    t.start()
 
     return ("", 204)
 
