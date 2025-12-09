@@ -1,16 +1,122 @@
-@app.route("/submit", methods=["POST", "HEAD"])
+import os
+from datetime import datetime
+
+from flask import Flask, request, jsonify, Response
+from twilio.rest import Client
+
+from sheets import (
+    add_subscriber,
+    get_all_subscribers,
+    save_daily_transcription,
+    get_latest_transcription,
+)
+from sms import send_sms
+from emailer import send_email
+
+app = Flask(__name__)
+
+SPREADSHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
+
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
+
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# City of Huntsville, AL Municipal Court Probation Office color code line
+HUNTSVILLE_COLOR_LINE = "+12564277808"
+
+# Last known good announcement text (for possible future use)
+LATEST_ANNOUNCEMENT_TEXT = None
+
+# Tracks whether we've already sent a "not updated yet" notice today
+NOT_UPDATED_NOTICE_SENT_DATE = None
+
+
+def get_form_field(data, *keys):
+    """Helper to read Carrd form fields, trying multiple possible names."""
+    for key in keys:
+        if key in data and isinstance(data[key], str) and data[key].strip():
+            return data[key].strip()
+    return ""
+
+
+def clean_transcription_text(raw_text: str) -> str:
+    """
+    Try to clean up Twilio transcription if the IVR message was recorded multiple times
+    (because the color line loops).
+
+    Strategy:
+      - Normalize whitespace
+      - Split into "sentences" on periods
+      - Remove exact duplicate sentences while preserving order
+    """
+    if not raw_text:
+        return raw_text
+
+    # Normalize whitespace
+    normalized = " ".join(raw_text.split())
+
+    # Split on periods into rough "sentences"
+    parts = [p.strip() for p in normalized.split(".") if p.strip()]
+    if not parts:
+        return normalized
+
+    seen = set()
+    unique_parts = []
+    for p in parts:
+        key = p.lower()
+        if key not in seen:
+            seen.add(key)
+            unique_parts.append(p)
+
+    cleaned = ". ".join(unique_parts)
+    # Add trailing period back if original had one
+    if normalized.strip().endswith("."):
+        cleaned += "."
+
+    return cleaned
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+
+def start_color_line_call():
+    """
+    Tell Twilio to call the Huntsville color line, record it,
+    and send Twilio's recording/transcription callback to us.
+    """
+    if not APP_BASE_URL:
+        raise RuntimeError("APP_BASE_URL is not set")
+
+    twiml_url = f"{APP_BASE_URL}/twiml/dial_color_line"
+    callback_url = f"{APP_BASE_URL}/twilio/recording-complete"
+
+    call = twilio_client.calls.create(
+        to=HUNTSVILLE_COLOR_LINE,
+        from_=TWILIO_FROM_NUMBER,
+        url=twiml_url,
+        record=True,
+        recording_status_callback=callback_url,
+        recording_status_callback_event=["completed"],
+    )
+    return call.sid
+
+
+@app.route("/submit", methods=["POST"])
 def submit():
     """
     Carrd form submit endpoint.
 
-    - Carrd sends HEAD first → we must return 200 OK or Carrd shows a 502 error.
-    - Then Carrd sends POST → actual subscriber data.
+    Behavior (your choice B):
+    - Save subscriber to Google Sheets.
+    - Do NOT send SMS or email immediately.
+    - Optionally trigger a call once if we have never fetched an announcement yet.
+    - Return quickly so Render does not time out.
     """
-
-    # Handle Carrd HEAD request safely
-    if request.method == "HEAD":
-        return ("", 200)
-
     global LATEST_ANNOUNCEMENT_TEXT
 
     form = request.form
@@ -22,62 +128,210 @@ def submit():
 
     if not email or not phone or not testing_center:
         return (
-            jsonify({
-                "status": "error",
-                "message": "Missing required fields (email, phone, testing_center).",
-            }),
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "Missing required fields (email, phone, testing_center).",
+                }
+            ),
             400,
         )
 
-    # 1) Save to Google Sheets
+    # 1) Save to Google Sheets (one quick API call)
     try:
         add_subscriber(full_name, email, phone, testing_center)
     except Exception as e:
         app.logger.exception("Failed to add subscriber: %s", e)
+        # Still return OK so Carrd shows success; we just log the error.
+        # You can change this to return 500 if you'd rather show an error.
 
-    # 2) Decide welcome message content
+    # 2) If we have NEVER seen an announcement yet, optionally kick off
+    #    an initial call. This is a single Twilio API call and should be fast.
     if LATEST_ANNOUNCEMENT_TEXT is None:
         try:
             start_color_line_call()
         except Exception as e:
-            app.logger.exception("Failed to trigger initial call: %s", e)
+            app.logger.exception("Failed to trigger initial call from submit: %s", e)
 
-        sms_body = (
-            "Welcome to ColorCodely alerts!\n\n"
-            "You’re subscribed. We're calling the color code line now. "
-            "You'll receive the latest announcement shortly."
-        )
-        email_subject = "Welcome to ColorCodely alerts"
-        email_body = (
-            f"Hi {full_name or ''},\n\n"
-            "You're now subscribed to ColorCodely.\n\n"
-            "We're fetching today's announcement now, and you'll receive it as soon as it's processed.\n\n"
-            "— ColorCodely"
+    # 3) Return immediately so the browser / Carrd does not wait on Twilio/Emails
+    return jsonify({"status": "ok"})
+
+
+@app.route("/twiml/dial_color_line", methods=["POST", "GET"])
+def twiml_dial_color_line():
+    """
+    TwiML that tells Twilio to dial the Huntsville color line and record it.
+    Twilio will invoke this when we start the outgoing call.
+
+    We set a timeLimit of 60 seconds so the call (and recording) doesn't run forever
+    while the IVR loops the same message.
+    """
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial record="record-from-answer-dual" timeLimit="60">
+    <Number>{HUNTSVILLE_COLOR_LINE}</Number>
+  </Dial>
+</Response>
+"""
+    return Response(xml, mimetype="text/xml")
+
+
+@app.route("/daily-call", methods=["POST"])
+def daily_call():
+    """
+    Endpoint you point your Render Cron Job at.
+
+    Each time this is called, we:
+    - Start a Twilio call to the color line
+    - Twilio then calls back to /twilio/recording-complete
+    - /twilio/recording-complete decides whether it's a NEW announcement
+      and whether to notify subscribers.
+    """
+    try:
+        call_sid = start_color_line_call()
+        return jsonify({"status": "started", "call_sid": call_sid})
+    except Exception as e:
+        app.logger.exception("Error starting daily call: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/twilio/recording-complete", methods=["POST"])
+def recording_complete():
+    """
+    Twilio recording/transcription callback.
+
+    Behavior:
+    - If the transcription is the SAME as the latest saved one:
+        -> Do NOT send yesterday's colors again
+        -> Send a one-time "recording not updated yet" SMS/email for today
+    - If the transcription is NEW:
+        -> Save it to Google Sheets
+        -> Update LATEST_ANNOUNCEMENT_TEXT
+        -> Send today's announcement to all subscribers
+    """
+    global LATEST_ANNOUNCEMENT_TEXT, NOT_UPDATED_NOTICE_SENT_DATE
+
+    form = request.form
+
+    transcription_text = form.get("TranscriptionText")
+    if not transcription_text:
+        transcription_text = (
+            "No transcription text was provided by Twilio. "
+            "You may need to enable or configure transcription for recordings."
         )
     else:
-        sms_body = (
-            "Welcome to ColorCodely alerts!\n\n"
-            "Here is the latest color code announcement:\n\n"
-            f"{LATEST_ANNOUNCEMENT_TEXT}"
+        # Clean up potential repeated loops from the IVR
+        transcription_text = clean_transcription_text(transcription_text)
+
+    # 1) Compare with the last saved transcription in Sheets
+    try:
+        last_date, last_text = get_latest_transcription()
+    except Exception as e:
+        app.logger.exception("Failed to read latest transcription: %s", e)
+        last_date, last_text = None, None
+
+    is_same_as_last = False
+    if last_text and transcription_text.strip() == last_text.strip():
+        is_same_as_last = True
+
+    # 2) Load all subscribers
+    try:
+        subscribers = get_all_subscribers()
+    except Exception as e:
+        app.logger.exception("Failed to load subscribers: %s", e)
+        subscribers = []
+
+    # 3) If it's the same as yesterday, don't resend it — send a "not updated yet" notice
+    if is_same_as_last:
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+        # Only send the "not updated yet" notice once per day
+        if NOT_UPDATED_NOTICE_SENT_DATE == today_str:
+            return ("", 204)
+
+        NOT_UPDATED_NOTICE_SENT_DATE = today_str
+
+        info_sms = (
+            "ColorCodely update:\n\n"
+            "The Huntsville Municipal Court color-code recording has not "
+            "been updated yet today. We’ll notify you as soon as a new "
+            "announcement is available."
         )
-        email_subject = "Welcome to ColorCodely – Latest Announcement"
-        email_body = (
-            f"Hi {full_name or ''},\n\n"
-            "You're now subscribed to ColorCodely alerts.\n\n"
-            "Here is the latest announcement:\n\n"
-            f"{LATEST_ANNOUNCEMENT_TEXT}\n\n"
+        info_subject = "ColorCodely: recording not updated yet"
+        info_body_template = (
+            "Hello {name},\n\n"
+            "We attempted to retrieve today's color code announcement, but the "
+            "recording has not been updated yet by the court.\n\n"
+            "We'll keep checking and notify you as soon as there is a new "
+            "announcement.\n\n"
             "— ColorCodely"
         )
 
-    # 3) Send SMS + email
-    try:
-        send_sms(phone, sms_body)
-    except Exception as e:
-        app.logger.exception("Failed to send welcome SMS: %s", e)
+        for sub in subscribers:
+            phone = sub.get("cell_number")
+            email = sub.get("email")
+            name = sub.get("full_name") or "there"
 
-    try:
-        send_email(email, email_subject, email_body)
-    except Exception as e:
-        app.logger.exception("Failed to send welcome email: %s", e)
+            if phone:
+                try:
+                    send_sms(phone, info_sms)
+                except Exception as e:
+                    app.logger.exception(
+                        "Failed to send 'not updated' SMS to %s: %s", phone, e
+                    )
 
-    return jsonify({"status": "ok"}), 200
+            if email:
+                try:
+                    body = info_body_template.format(name=name)
+                    send_email(email, info_subject, body)
+                except Exception as e:
+                    app.logger.exception(
+                        "Failed to send 'not updated' email to %s: %s", email, e
+                    )
+
+        return ("", 204)
+
+    # 4) At this point, we have a **new** transcription 🎉
+    LATEST_ANNOUNCEMENT_TEXT = transcription_text
+    NOT_UPDATED_NOTICE_SENT_DATE = None  # reset for the next day
+
+    # Save to Sheets
+    try:
+        save_daily_transcription(transcription_text)
+    except Exception as e:
+        app.logger.exception("Failed to save daily transcription: %s", e)
+
+    # Notify subscribers
+    sms_body = f"Today's color code announcement:\n\n{transcription_text}"
+    email_subject = "Today's ColorCodely announcement"
+    email_body_template = (
+        "Hello {name},\n\n"
+        "Here is today's color code announcement:\n\n"
+        "{text}\n\n"
+        "— ColorCodely"
+    )
+
+    for sub in subscribers:
+        phone = sub.get("cell_number")
+        email = sub.get("email")
+        name = sub.get("full_name") or "there"
+
+        if phone:
+            try:
+                send_sms(phone, sms_body)
+            except Exception as e:
+                app.logger.exception("Failed to send daily SMS to %s: %s", phone, e)
+
+        if email:
+            try:
+                body = email_body_template.format(name=name, text=transcription_text)
+                send_email(email, email_subject, body)
+            except Exception as e:
+                app.logger.exception("Failed to send daily email to %s: %s", email, e)
+
+    return ("", 204)
+
+
+if __name__ == "__main__":
+    # Local testing only; Render uses gunicorn with PORT
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
