@@ -37,6 +37,43 @@ def get_form_field(data, *keys):
     return ""
 
 
+def clean_transcription_text(raw_text: str) -> str:
+    """
+    Try to clean up Twilio transcription if the IVR message was recorded multiple times
+    (because the color line loops).
+
+    Strategy:
+      - Normalize whitespace
+      - Split into "sentences" on periods
+      - Remove exact duplicate sentences while preserving order
+    """
+    if not raw_text:
+        return raw_text
+
+    # Normalize whitespace
+    normalized = " ".join(raw_text.split())
+
+    # Split on periods into rough "sentences"
+    parts = [p.strip() for p in normalized.split(".") if p.strip()]
+    if not parts:
+        return normalized
+
+    seen = set()
+    unique_parts = []
+    for p in parts:
+        key = p.lower()
+        if key not in seen:
+            seen.add(key)
+            unique_parts.append(p)
+
+    cleaned = ". ".join(unique_parts)
+    # Add trailing period back if original had one
+    if normalized.strip().endswith("."):
+        cleaned += "."
+
+    return cleaned
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -158,10 +195,13 @@ def twiml_dial_color_line():
     """
     TwiML that tells Twilio to dial the Huntsville color line and record it.
     Twilio will invoke this when we start the outgoing call.
+
+    We set a timeLimit of 60 seconds so the call (and recording) doesn't run forever
+    while the IVR loops the same message.
     """
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Dial record="record-from-answer-dual">
+  <Dial record="record-from-answer-dual" timeLimit="60">
     <Number>{HUNTSVILLE_COLOR_LINE}</Number>
   </Dial>
 </Response>
@@ -212,6 +252,9 @@ def recording_complete():
             "No transcription text was provided by Twilio. "
             "You may need to enable or configure transcription for recordings."
         )
+    else:
+        # Clean up potential repeated loops from the IVR
+        transcription_text = clean_transcription_text(transcription_text)
 
     # 1) Compare with the last saved transcription in Sheets
     try:
