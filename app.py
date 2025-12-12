@@ -16,9 +16,9 @@ from emailer import send_email
 
 app = Flask(__name__)
 
-# ----------------------------------------
+# --------------------------------------------------
 # ENV / CONFIG
-# ----------------------------------------
+# --------------------------------------------------
 SPREADSHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
 
@@ -31,26 +31,23 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 # City of Huntsville, AL Municipal Court Probation Office color code line
 HUNTSVILLE_COLOR_LINE = "+12564277808"
 
-# Last known good announcement text
+# Cache
 LATEST_ANNOUNCEMENT_TEXT = None
-
-# Tracks whether we've already sent a "not updated yet" notice today
 NOT_UPDATED_NOTICE_SENT_DATE = None
 
 
-# ----------------------------------------
-# ASYNC HELPER
-# ----------------------------------------
+# --------------------------------------------------
+# ASYNC UTIL
+# --------------------------------------------------
 def async_task(fn, *args, **kwargs):
-    """Run in background thread to avoid Render timeouts."""
     t = Thread(target=fn, args=args, kwargs=kwargs)
     t.daemon = True
     t.start()
 
 
-# ----------------------------------------
+# --------------------------------------------------
 # HELPERS
-# ----------------------------------------
+# --------------------------------------------------
 def get_form_field(data, *keys):
     for key in keys:
         if key in data and isinstance(data[key], str) and data[key].strip():
@@ -70,7 +67,6 @@ def clean_transcription_text(raw_text: str) -> str:
 
     seen = set()
     unique_parts = []
-
     for p in parts:
         key = p.lower()
         if key not in seen:
@@ -78,25 +74,25 @@ def clean_transcription_text(raw_text: str) -> str:
             unique_parts.append(p)
 
     cleaned = ". ".join(unique_parts)
+
     if normalized.strip().endswith("."):
         cleaned += "."
 
     return cleaned
 
 
-# ----------------------------------------
+# --------------------------------------------------
 # HEALTH CHECK
-# ----------------------------------------
+# --------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
 
 
-# ----------------------------------------
-# TWILIO CALL OUTBOUND
-# ----------------------------------------
+# --------------------------------------------------
+# TWILIO OUTBOUND CALL
+# --------------------------------------------------
 def start_color_line_call():
-    """Triggers Twilio to call the Huntsville color line."""
     if not APP_BASE_URL:
         raise RuntimeError("APP_BASE_URL is not set")
 
@@ -114,9 +110,9 @@ def start_color_line_call():
     return call.sid
 
 
-# ----------------------------------------
-# CARRD FORM SUBMIT
-# ----------------------------------------
+# --------------------------------------------------
+# SUBSCRIBE ENDPOINT
+# --------------------------------------------------
 @app.route("/submit", methods=["POST"])
 def submit():
     global LATEST_ANNOUNCEMENT_TEXT
@@ -129,44 +125,45 @@ def submit():
     testing_center = get_form_field(form, "testing_center", "Testing Center")
 
     if not email or not phone or not testing_center:
-        return jsonify({
-            "status": "error",
-            "message": "Missing required fields (email, phone, testing_center).",
-        }), 400
+        return jsonify({"status": "error",
+                        "message": "Missing required fields (email, phone, testing_center)."}), 400
 
     try:
         add_subscriber(full_name, email, phone, testing_center)
     except Exception as e:
         app.logger.exception("Failed to add subscriber: %s", e)
 
+    # INITIAL CALL CASE
     if LATEST_ANNOUNCEMENT_TEXT is None:
         try:
             start_color_line_call()
         except Exception as e:
-            app.logger.exception("Initial call error: %s", e)
+            app.logger.exception("Failed to trigger initial call: %s", e)
 
         sms_body = (
             "Welcome to ColorCodely alerts!\n\n"
-            "You’re subscribed. We’ve started a call to fetch the latest "
-            "color code announcement and you’ll receive it shortly."
+            "You’re subscribed. We’ve started a call to fetch today's "
+            "color code announcement. You’ll receive the update shortly."
         )
         email_subject = "Welcome to ColorCodely alerts"
         email_body = (
             f"Hi {full_name or ''},\n\n"
-            "Thanks for subscribing to ColorCodely.\n"
-            "We’re fetching the latest announcement now.\n\n"
+            "Thanks for subscribing. We are fetching the latest "
+            "color code announcement now.\n\n"
             "— ColorCodely"
         )
+
     else:
+        # Subscriber joins after first transcription
         sms_body = (
             "Welcome to ColorCodely alerts!\n\n"
-            "Here is the most recent color code announcement:\n\n"
+            "Here is the most recent announcement:\n\n"
             f"{LATEST_ANNOUNCEMENT_TEXT}"
         )
-        email_subject = "Welcome to ColorCodely"
+        email_subject = "Welcome to ColorCodely – Latest Announcement"
         email_body = (
             f"Hi {full_name or ''},\n\n"
-            "You're now subscribed.\n\n"
+            "You’re now subscribed.\n\n"
             f"Latest announcement:\n\n{LATEST_ANNOUNCEMENT_TEXT}\n\n"
             "— ColorCodely"
         )
@@ -177,21 +174,22 @@ def submit():
     return jsonify({"status": "ok"})
 
 
-# ----------------------------------------
-# TWIML FOR OUTBOUND CALL (UPDATED)
-# ----------------------------------------
+# --------------------------------------------------
+# TWIML — TRANSCRIPTION ENABLED
+# --------------------------------------------------
 @app.route("/twiml/dial_color_line", methods=["POST", "GET"])
 def twiml_dial_color_line():
-
-    recording_callback = f"{APP_BASE_URL}/twilio/recording-complete"
-
+    """
+    THIS VERSION FORCES TWILIO TO TRANSCRIBE THE RECORDING.
+    """
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Dial
-      record="record-from-answer-dual"
-      timeLimit="60"
-      recordingStatusCallback="{recording_callback}"
-      recordingStatusCallbackEvent="completed">
+  <Dial record="record-from-answer-dual"
+        transcribe="true"
+        transcriptionType="auto"
+        recordingStatusCallback="{APP_BASE_URL}/twilio/recording-complete"
+        recordingStatusCallbackEvent="completed"
+        timeLimit="60">
     <Number>{HUNTSVILLE_COLOR_LINE}</Number>
   </Dial>
 </Response>
@@ -199,37 +197,39 @@ def twiml_dial_color_line():
     return Response(xml, mimetype="text/xml")
 
 
-# ----------------------------------------
-# DAILY CALL (Render Cron)
-# ----------------------------------------
+# --------------------------------------------------
+# DAILY CALL (CRON)
+# --------------------------------------------------
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
     try:
         call_sid = start_color_line_call()
         return jsonify({"status": "started", "call_sid": call_sid})
     except Exception as e:
-        app.logger.exception("Daily call error: %s", e)
+        app.logger.exception("Error starting daily call: %s", e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ----------------------------------------
-# BACKGROUND TRANSCRIPTION
-# ----------------------------------------
+# --------------------------------------------------
+# PROCESS TRANSCRIPTION
+# --------------------------------------------------
 def _process_transcription(transcription_text: str):
     global LATEST_ANNOUNCEMENT_TEXT, NOT_UPDATED_NOTICE_SENT_DATE
 
     try:
         last_date, last_text = get_latest_transcription()
     except Exception:
-        last_date, last_text = None, None
+        last_text = None
 
-    is_same = last_text and transcription_text.strip() == last_text.strip()
+    is_same = last_text and transcription_text.strip() == (last_text or "").strip()
 
     try:
         subscribers = get_all_subscribers()
-    except Exception:
+    except Exception as e:
+        app.logger.exception("Failed fetching subscribers: %s", e)
         subscribers = []
 
+    # NOT UPDATED YET CASE
     if is_same:
         today = datetime.utcnow().strftime("%Y-%m-%d")
         if NOT_UPDATED_NOTICE_SENT_DATE == today:
@@ -237,12 +237,16 @@ def _process_transcription(transcription_text: str):
 
         NOT_UPDATED_NOTICE_SENT_DATE = today
 
-        info_sms = (
+        sms_msg = (
             "ColorCodely update:\n\n"
-            "Today's color code recording has not been updated yet. "
-            "You'll be notified when a new announcement is available."
+            "The Huntsville color-code line has not posted a new update yet today."
         )
-        info_subject = "ColorCodely: No new update yet"
+        email_subject = "ColorCodely: recording not updated yet"
+        email_body_template = (
+            "Hello {name},\n\n"
+            "Today's color code announcement has not been updated yet.\n\n"
+            "— ColorCodely"
+        )
 
         for sub in subscribers:
             phone = sub.get("cell_number")
@@ -250,23 +254,33 @@ def _process_transcription(transcription_text: str):
             name = sub.get("full_name") or "there"
 
             if phone:
-                async_task(send_sms, phone, info_sms)
+                async_task(send_sms, phone, sms_msg)
+
             if email:
-                async_task(send_email, email, info_subject,
-                           f"Hello {name},\n\n{info_sms}\n\n— ColorCodely")
+                async_task(send_email,
+                           email,
+                           email_subject,
+                           email_body_template.format(name=name))
+
         return
 
-    # NEW UPDATE
+    # NEW TRANSCRIPTION
     LATEST_ANNOUNCEMENT_TEXT = transcription_text
     NOT_UPDATED_NOTICE_SENT_DATE = None
 
     try:
         save_daily_transcription(transcription_text)
-    except Exception:
-        pass
+    except Exception as e:
+        app.logger.exception("Failed to save transcription: %s", e)
 
-    sms_body = f"Today's color code announcement:\n\n{transcription_text}"
+    sms_msg = f"Today's color code announcement:\n\n{transcription_text}"
     email_subject = "Today's ColorCodely announcement"
+    email_template = (
+        "Hello {name},\n\n"
+        "Today's color code announcement:\n\n"
+        "{text}\n\n"
+        "— ColorCodely"
+    )
 
     for sub in subscribers:
         phone = sub.get("cell_number")
@@ -274,39 +288,37 @@ def _process_transcription(transcription_text: str):
         name = sub.get("full_name") or "there"
 
         if phone:
-            async_task(send_sms, phone, sms_body)
+            async_task(send_sms, phone, sms_msg)
+
         if email:
-            email_body = (
-                f"Hello {name},\n\n"
-                f"{sms_body}\n\n— ColorCodely"
-            )
-            async_task(send_email, email, email_subject, email_body)
+            async_task(send_email,
+                       email,
+                       email_subject,
+                       email_template.format(name=name, text=transcription_text))
 
 
-# ----------------------------------------
-# TWILIO CALLBACK FOR RECORDING
-# ----------------------------------------
+# --------------------------------------------------
+# TWILIO RECORDING CALLBACK
+# --------------------------------------------------
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
-    form = request.form
+    transcription_text = request.form.get("TranscriptionText")
 
-    transcription_text = form.get("TranscriptionText")
     if not transcription_text:
         transcription_text = (
             "No transcription text was provided by Twilio. "
-            "You may need to enable transcription."
+            "Transcription may not be enabled."
         )
     else:
         transcription_text = clean_transcription_text(transcription_text)
 
     async_task(_process_transcription, transcription_text)
-
     return ("", 204)
 
 
-# ----------------------------------------
-# LOCAL DEV ENTRY
-# ----------------------------------------
+# --------------------------------------------------
+# MAIN (LOCAL)
+# --------------------------------------------------
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
