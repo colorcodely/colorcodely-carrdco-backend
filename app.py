@@ -1,125 +1,144 @@
 import os
-import requests
+import json
 import tempfile
+import requests
 from flask import Flask, request, Response
-from twilio.twiml.voice_response import VoiceResponse, Dial
 from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse, Dial
 from openai import OpenAI
-from collections import defaultdict
 
 app = Flask(__name__)
 
-# --------------------
-# ENV / CLIENTS
-# --------------------
-TWILIO_SID = os.environ["TWILIO_SID"]
-TWILIO_AUTH = os.environ["TWILIO_AUTH"]
-FROM_NUMBER = os.environ["TWILIO_FROM"]
-TARGET_NUMBER = os.environ["COLOR_CODE_NUMBER"]
+# =========================
+# Environment variables
+# =========================
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+APP_BASE_URL = os.getenv("APP_BASE_URL")
 
-twilio = Client(TWILIO_SID, TWILIO_AUTH)
+# Fail gracefully (log, don’t crash)
+missing = []
+for name, val in {
+    "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
+    "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
+    "TWILIO_FROM_NUMBER": TWILIO_FROM_NUMBER,
+    "OPENAI_API_KEY": OPENAI_API_KEY,
+}.items():
+    if not val:
+        missing.append(name)
+
+if missing:
+    print("⚠️ Missing environment variables:", ", ".join(missing))
+
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# One-shot guards
-PROCESSED_CALLS = set()
+# =========================
+# One-shot recording guard
+# =========================
 
+ACTIVE_CALLS = set()
+
+# =========================
 # Known color vocabulary
+# =========================
+
 KNOWN_COLORS = {
-    "amber","apple","aqua","banana","beige","black","blue","bone","bronze",
-    "brown","burgundy","charcoal","chartreuse","cherry","chestnut","copper",
-    "coral","cream","creme","crimson","eggplant","emerald","fuchsia","ginger",
-    "gold","gray","green","hazel","indigo","ivory","jade","jasmine","khaki",
-    "lavender","lemon","lilac","lime","magenta","mahogany","maroon","mauve",
-    "mint","navy","olive","onyx","opal","orange","orchid","peach","pearl",
-    "periwinkle","pink","platinum","plum","purple","raspberry","red","rose",
-    "ruby","sage","sapphire","sienna","silver","tan","tangerine","teal",
-    "turquoise","vanilla","violet","watermelon","white","yellow"
+    "amber","apple","aqua","banana","beige","black","blue","bone","bronze","brown",
+    "burgundy","charcoal","chartreuse","cherry","chestnut","copper","coral","cream",
+    "creme","crimson","eggplant","emerald","fuchsia","ginger","gold","gray","green",
+    "hazel","indigo","ivory","jade","jasmine","khaki","lavender","lemon","lilac",
+    "lime","magenta","mahogany","maroon","mauve","mint","navy","olive","onyx","opal",
+    "orange","orchid","peach","pearl","periwinkle","pink","platinum","plum","purple",
+    "raspberry","red","rose","ruby","sage","sapphire","sienna","silver","tan",
+    "tangerine","teal","turquoise","vanilla","violet","watermelon","white","yellow"
 }
 
-# --------------------
-# TWIML: DIAL
-# --------------------
+# =========================
+# TwiML: Dial once, record once
+# =========================
+
 @app.route("/twiml/dial_color_line", methods=["POST"])
 def dial_color_line():
-    resp = VoiceResponse()
+    call_sid = request.form.get("CallSid")
+
+    if call_sid in ACTIVE_CALLS:
+        print("🔁 Duplicate TwiML request ignored:", call_sid)
+        return Response("", status=204)
+
+    ACTIVE_CALLS.add(call_sid)
+
+    vr = VoiceResponse()
     dial = Dial(
         record="record-from-answer-dual",
-        timeLimit=75,
-        recordingStatusCallback="/twilio/recording-complete",
-        recordingStatusCallbackEvent="completed"
+        timeLimit=65
     )
-    dial.number(TARGET_NUMBER)
-    resp.append(dial)
-    return Response(str(resp), mimetype="text/xml")
+    dial.number("+12564277808")
+    vr.append(dial)
 
-# --------------------
-# RECORDING COMPLETE
-# --------------------
+    return Response(str(vr), mimetype="text/xml")
+
+# =========================
+# Recording complete → Whisper
+# =========================
+
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
+    recording_sid = request.form.get("RecordingSid")
     call_sid = request.form.get("CallSid")
-    if not call_sid or call_sid in PROCESSED_CALLS:
-        return ("ok", 200)
 
-    PROCESSED_CALLS.add(call_sid)
+    if not recording_sid or not call_sid:
+        return ("Missing data", 400)
 
-    # Fetch all recordings for this call
-    recordings = twilio.recordings.list(call_sid=call_sid)
-    if not recordings:
-        return ("no recordings", 200)
+    print("🎧 Recording complete:", recording_sid)
 
-    # Pick the longest recording (the real announcement)
-    longest = max(recordings, key=lambda r: int(r.duration or 0))
-    audio_url = f"https://api.twilio.com{longest.uri.replace('.json', '.wav')}"
+    # Download audio
+    audio_url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Recordings/{recording_sid}.wav"
+    auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    audio_resp = requests.get(audio_url, auth=auth)
 
-    # Download WAV
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        r = requests.get(audio_url, auth=(TWILIO_SID, TWILIO_AUTH))
-        tmp.write(r.content)
-        wav_path = tmp.name
+    if audio_resp.status_code != 200:
+        print("❌ Failed to download audio")
+        return ("Download failed", 500)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(audio_resp.content)
+        audio_path = f.name
 
     # Whisper transcription
-    with open(wav_path, "rb") as audio_file:
-        transcript = openai_client.audio.transcriptions.create(
-            file=audio_file,
-            model="whisper-1"
-        )
+    transcript = openai_client.audio.transcriptions.create(
+        file=open(audio_path, "rb"),
+        model="whisper-1",
+        language="en"
+    ).text.lower()
 
-    raw_text = transcript.text.lower()
-    cleaned = clean_transcript(raw_text)
+    cleaned = clean_transcript(transcript)
 
     send_email(cleaned)
 
-    return ("ok", 200)
+    return ("OK", 204)
 
-# --------------------
-# CLEAN TRANSCRIPT
-# --------------------
+# =========================
+# Transcript cleanup
+# =========================
+
 def clean_transcript(text):
-    words = text.replace(",", " ").split()
-    detected = sorted({w for w in words if w in KNOWN_COLORS})
+    words = text.replace(",", " ").replace(".", " ").split()
+    found = [w for w in words if w in KNOWN_COLORS]
 
-    if "no" in words and "called" in words:
-        return "No colors are being called today."
+    if not found:
+        return "No colors confidently detected."
 
-    if detected:
-        return f"Colors called today: {', '.join(detected)}"
+    unique = sorted(set(found))
+    return "Colors called today: " + ", ".join(unique)
 
-    return "Color announcement could not be confidently confirmed."
+# =========================
+# Email (stub – uses your existing SMTP code)
+# =========================
 
-# --------------------
-# EMAIL
-# --------------------
 def send_email(body):
-    # Your existing email logic here
-    print("EMAIL CONTENT:")
+    print("📧 EMAIL CONTENT:")
     print(body)
-
-# --------------------
-# HEALTH
-# --------------------
-@app.route("/")
-def health():
-    return "OK", 200
