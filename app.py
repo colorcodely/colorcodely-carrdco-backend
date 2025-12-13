@@ -1,10 +1,8 @@
 import os
 from datetime import datetime
 from threading import Thread
-
 from flask import Flask, request, jsonify, Response
 from twilio.rest import Client
-from difflib import get_close_matches
 
 from sheets import (
     add_subscriber,
@@ -12,184 +10,145 @@ from sheets import (
     save_daily_transcription,
     get_latest_transcription,
 )
-from sms import send_sms
 from emailer import send_email
-from color_codes import COLOR_CODES
 
 app = Flask(__name__)
 
-# ----------------------------------------
+# -------------------------------------------------
 # CONFIG
-# ----------------------------------------
+# -------------------------------------------------
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
-
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
-
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
 
 HUNTSVILLE_COLOR_LINE = "+12564277808"
 
-LATEST_ANNOUNCEMENT_TEXT = None
-NOT_UPDATED_NOTICE_SENT_DATE = None
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# Prevent duplicate processing per call
 PROCESSED_CALL_SIDS = set()
 
-# ----------------------------------------
-# ASYNC
-# ----------------------------------------
-def async_task(fn, *args, **kwargs):
-    t = Thread(target=fn, args=args, kwargs=kwargs)
+# -------------------------------------------------
+# ASYNC HELPER
+# -------------------------------------------------
+def async_task(fn, *args):
+    t = Thread(target=fn, args=args)
     t.daemon = True
     t.start()
 
-# ----------------------------------------
-# TRANSCRIPTION CLEANUP
-# ----------------------------------------
-STOP_PHRASES = [
-    "if your color is called",
-    "you must report",
-    "call again later",
-    "temporarily unable"
-]
+# -------------------------------------------------
+# CLEAN TRANSCRIPTION
+# -------------------------------------------------
+def clean_transcription(text):
+    if not text:
+        return None
 
-def trim_at_stop_phrase(text: str) -> str:
-    lower = text.lower()
-    for phrase in STOP_PHRASES:
-        idx = lower.find(phrase)
+    text = " ".join(text.split())
+
+    stop_phrases = [
+        "this system is temporarily unable",
+        "call again later goodbye",
+    ]
+    for phrase in stop_phrases:
+        idx = text.lower().find(phrase)
         if idx != -1:
-            return text[: idx + len(phrase)]
-    return text
+            text = text[:idx].strip()
 
-def normalize_color(word: str):
-    word = word.lower().strip()
-    matches = get_close_matches(word, COLOR_CODES, n=1, cutoff=0.72)
-    return matches[0] if matches else None
+    # De-duplicate repeated sentences
+    sentences = [s.strip() for s in text.split(".") if s.strip()]
+    seen = set()
+    unique = []
+    for s in sentences:
+        key = s.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(s)
 
-def extract_called_colors(transcription: str):
-    transcription = trim_at_stop_phrase(transcription)
-    words = transcription.replace(",", " ").replace(".", " ").split()
+    return ". ".join(unique)
 
-    found = set()
-    for word in words:
-        color = normalize_color(word)
-        if color:
-            found.add(color)
-
-    return sorted(found)
-
-def build_clean_announcement(date_str: str, colors: list[str]) -> str:
-    if not colors:
-        return (
-            f"The City of Huntsville’s Color Code announcement for {date_str} "
-            "could not be confidently confirmed."
-        )
-
-    formatted = ", ".join(c.title() for c in colors)
-
-    return (
-        f"The City of Huntsville’s Color Code Colors for {date_str} are:\n\n"
-        f"{formatted}.\n\n"
-        "If your color is called, you must report for drug screening."
+# -------------------------------------------------
+# TWILIO CALL
+# -------------------------------------------------
+def start_daily_call():
+    call = twilio_client.calls.create(
+        to=HUNTSVILLE_COLOR_LINE,
+        from_=TWILIO_FROM_NUMBER,
+        url=f"{APP_BASE_URL}/twiml/dial_color_line",
+        record=True,
+        trim="trim-silence",
+        recording_status_callback=f"{APP_BASE_URL}/twilio/recording-complete",
+        recording_status_callback_event=["completed"],
+        timeout=55,
     )
+    return call.sid
 
-# ----------------------------------------
-# HEALTH
-# ----------------------------------------
+# -------------------------------------------------
+# ROUTES
+# -------------------------------------------------
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
 
-# ----------------------------------------
-# TWILIO CALL
-# ----------------------------------------
-def start_color_line_call():
-    twiml_url = f"{APP_BASE_URL}/twiml/dial_color_line"
-    callback_url = f"{APP_BASE_URL}/twilio/recording-complete"
+@app.route("/daily-call", methods=["POST"])
+def daily_call():
+    sid = start_daily_call()
+    return jsonify({"status": "started", "call_sid": sid})
 
-    call = twilio_client.calls.create(
-        to=HUNTSVILLE_COLOR_LINE,
-        from_=TWILIO_FROM_NUMBER,
-        url=twiml_url,
-        record=True,
-        recording_status_callback=callback_url,
-        recording_status_callback_event=["completed"],
-    )
-    return call.sid
-
-# ----------------------------------------
-# TWIML
-# ----------------------------------------
-@app.route("/twiml/dial_color_line", methods=["GET", "POST"])
-def twiml_dial_color_line():
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+@app.route("/twiml/dial_color_line", methods=["POST", "GET"])
+def dial_color_line():
+    xml = f"""
 <Response>
-  <Dial record="record-from-answer-dual" timeLimit="65">
+  <Dial
+    answerOnBridge="true"
+    record="record-from-answer"
+    timeLimit="45">
     <Number>{HUNTSVILLE_COLOR_LINE}</Number>
   </Dial>
 </Response>
 """
-    return Response(xml, mimetype="text/xml")
+    return Response(xml.strip(), mimetype="text/xml")
 
-# ----------------------------------------
-# DAILY CALL (Render Cron)
-# ----------------------------------------
-@app.route("/daily-call", methods=["POST"])
-def daily_call():
-    call_sid = start_color_line_call()
-    return jsonify({"status": "started", "call_sid": call_sid})
-
-# ----------------------------------------
-# TRANSCRIPTION HANDLER
-# ----------------------------------------
-def _process_transcription(call_sid: str, transcription_text: str):
-    global LATEST_ANNOUNCEMENT_TEXT, NOT_UPDATED_NOTICE_SENT_DATE
+@app.route("/twilio/recording-complete", methods=["POST"])
+def recording_complete():
+    call_sid = request.form.get("CallSid")
+    raw_text = request.form.get("TranscriptionText", "")
 
     if call_sid in PROCESSED_CALL_SIDS:
-        return
+        return ("", 204)
 
     PROCESSED_CALL_SIDS.add(call_sid)
 
-    cleaned_colors = extract_called_colors(transcription_text)
-    today = datetime.now().strftime("%A, %B %d")
-    announcement = build_clean_announcement(today, cleaned_colors)
+    cleaned = clean_transcription(raw_text)
+    async_task(process_transcription, cleaned)
 
-    LATEST_ANNOUNCEMENT_TEXT = announcement
-    NOT_UPDATED_NOTICE_SENT_DATE = None
-
-    save_daily_transcription(announcement)
-
-    subscribers = get_all_subscribers()
-
-    for sub in subscribers:
-        phone = sub.get("cell_number")
-        email = sub.get("email")
-        name = sub.get("full_name") or "there"
-
-        if phone:
-            async_task(send_sms, phone, announcement)
-
-        if email:
-            body = f"Hello {name},\n\n{announcement}\n\n— ColorCodely"
-            async_task(send_email, email, "Today's ColorCodely announcement", body)
-
-# ----------------------------------------
-# TWILIO CALLBACK
-# ----------------------------------------
-@app.route("/twilio/recording-complete", methods=["POST"])
-def recording_complete():
-    form = request.form
-    call_sid = form.get("CallSid")
-
-    transcription_text = form.get("TranscriptionText") or ""
-
-    async_task(_process_transcription, call_sid, transcription_text)
     return ("", 204)
 
-# ----------------------------------------
-# LOCAL
-# ----------------------------------------
+# -------------------------------------------------
+# PROCESS TRANSCRIPTION
+# -------------------------------------------------
+def process_transcription(text):
+    subscribers = get_all_subscribers()
+
+    if not text:
+        msg = (
+            "The City of Huntsville’s Color Code announcement "
+            "could not be confidently confirmed."
+        )
+        for s in subscribers:
+            if s.get("email"):
+                send_email(s["email"], "Color Code Update", msg)
+        return
+
+    save_daily_transcription(text)
+
+    for s in subscribers:
+        if s.get("email"):
+            send_email(
+                s["email"],
+                "Today's Color Code Announcement",
+                text,
+            )
+
+# -------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
