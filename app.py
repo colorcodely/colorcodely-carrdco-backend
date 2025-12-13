@@ -1,154 +1,125 @@
 import os
-from datetime import datetime
-from threading import Thread
-from flask import Flask, request, jsonify, Response
+import requests
+import tempfile
+from flask import Flask, request, Response
+from twilio.twiml.voice_response import VoiceResponse, Dial
 from twilio.rest import Client
-
-from sheets import (
-    add_subscriber,
-    get_all_subscribers,
-    save_daily_transcription,
-    get_latest_transcription,
-)
-from emailer import send_email
+from openai import OpenAI
+from collections import defaultdict
 
 app = Flask(__name__)
 
-# -------------------------------------------------
-# CONFIG
-# -------------------------------------------------
-APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
-TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
+# --------------------
+# ENV / CLIENTS
+# --------------------
+TWILIO_SID = os.environ["TWILIO_SID"]
+TWILIO_AUTH = os.environ["TWILIO_AUTH"]
+FROM_NUMBER = os.environ["TWILIO_FROM"]
+TARGET_NUMBER = os.environ["COLOR_CODE_NUMBER"]
 
-HUNTSVILLE_COLOR_LINE = "+12564277808"
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+twilio = Client(TWILIO_SID, TWILIO_AUTH)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-PROCESSED_CALL_SIDS = set()
+# One-shot guards
+PROCESSED_CALLS = set()
 
-# -------------------------------------------------
-# ASYNC HELPER
-# -------------------------------------------------
-def async_task(fn, *args):
-    t = Thread(target=fn, args=args)
-    t.daemon = True
-    t.start()
+# Known color vocabulary
+KNOWN_COLORS = {
+    "amber","apple","aqua","banana","beige","black","blue","bone","bronze",
+    "brown","burgundy","charcoal","chartreuse","cherry","chestnut","copper",
+    "coral","cream","creme","crimson","eggplant","emerald","fuchsia","ginger",
+    "gold","gray","green","hazel","indigo","ivory","jade","jasmine","khaki",
+    "lavender","lemon","lilac","lime","magenta","mahogany","maroon","mauve",
+    "mint","navy","olive","onyx","opal","orange","orchid","peach","pearl",
+    "periwinkle","pink","platinum","plum","purple","raspberry","red","rose",
+    "ruby","sage","sapphire","sienna","silver","tan","tangerine","teal",
+    "turquoise","vanilla","violet","watermelon","white","yellow"
+}
 
-# -------------------------------------------------
-# CLEAN TRANSCRIPTION
-# -------------------------------------------------
-def clean_transcription(text):
-    if not text:
-        return None
-
-    text = " ".join(text.split())
-
-    stop_phrases = [
-        "this system is temporarily unable",
-        "call again later goodbye",
-    ]
-    for phrase in stop_phrases:
-        idx = text.lower().find(phrase)
-        if idx != -1:
-            text = text[:idx].strip()
-
-    # De-duplicate repeated sentences
-    sentences = [s.strip() for s in text.split(".") if s.strip()]
-    seen = set()
-    unique = []
-    for s in sentences:
-        key = s.lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(s)
-
-    return ". ".join(unique)
-
-# -------------------------------------------------
-# TWILIO CALL
-# -------------------------------------------------
-def start_daily_call():
-    call = twilio_client.calls.create(
-        to=HUNTSVILLE_COLOR_LINE,
-        from_=TWILIO_FROM_NUMBER,
-        url=f"{APP_BASE_URL}/twiml/dial_color_line",
-        record=True,
-        trim="trim-silence",
-        recording_status_callback=f"{APP_BASE_URL}/twilio/recording-complete",
-        recording_status_callback_event=["completed"],
-        timeout=55,
-    )
-    return call.sid
-
-# -------------------------------------------------
-# ROUTES
-# -------------------------------------------------
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
-
-@app.route("/daily-call", methods=["POST"])
-def daily_call():
-    sid = start_daily_call()
-    return jsonify({"status": "started", "call_sid": sid})
-
-@app.route("/twiml/dial_color_line", methods=["POST", "GET"])
+# --------------------
+# TWIML: DIAL
+# --------------------
+@app.route("/twiml/dial_color_line", methods=["POST"])
 def dial_color_line():
-    xml = f"""
-<Response>
-  <Dial
-    answerOnBridge="true"
-    record="record-from-answer"
-    timeLimit="45">
-    <Number>{HUNTSVILLE_COLOR_LINE}</Number>
-  </Dial>
-</Response>
-"""
-    return Response(xml.strip(), mimetype="text/xml")
+    resp = VoiceResponse()
+    dial = Dial(
+        record="record-from-answer-dual",
+        timeLimit=75,
+        recordingStatusCallback="/twilio/recording-complete",
+        recordingStatusCallbackEvent="completed"
+    )
+    dial.number(TARGET_NUMBER)
+    resp.append(dial)
+    return Response(str(resp), mimetype="text/xml")
 
+# --------------------
+# RECORDING COMPLETE
+# --------------------
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
     call_sid = request.form.get("CallSid")
-    raw_text = request.form.get("TranscriptionText", "")
+    if not call_sid or call_sid in PROCESSED_CALLS:
+        return ("ok", 200)
 
-    if call_sid in PROCESSED_CALL_SIDS:
-        return ("", 204)
+    PROCESSED_CALLS.add(call_sid)
 
-    PROCESSED_CALL_SIDS.add(call_sid)
+    # Fetch all recordings for this call
+    recordings = twilio.recordings.list(call_sid=call_sid)
+    if not recordings:
+        return ("no recordings", 200)
 
-    cleaned = clean_transcription(raw_text)
-    async_task(process_transcription, cleaned)
+    # Pick the longest recording (the real announcement)
+    longest = max(recordings, key=lambda r: int(r.duration or 0))
+    audio_url = f"https://api.twilio.com{longest.uri.replace('.json', '.wav')}"
 
-    return ("", 204)
+    # Download WAV
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        r = requests.get(audio_url, auth=(TWILIO_SID, TWILIO_AUTH))
+        tmp.write(r.content)
+        wav_path = tmp.name
 
-# -------------------------------------------------
-# PROCESS TRANSCRIPTION
-# -------------------------------------------------
-def process_transcription(text):
-    subscribers = get_all_subscribers()
-
-    if not text:
-        msg = (
-            "The City of Huntsville’s Color Code announcement "
-            "could not be confidently confirmed."
+    # Whisper transcription
+    with open(wav_path, "rb") as audio_file:
+        transcript = openai_client.audio.transcriptions.create(
+            file=audio_file,
+            model="whisper-1"
         )
-        for s in subscribers:
-            if s.get("email"):
-                send_email(s["email"], "Color Code Update", msg)
-        return
 
-    save_daily_transcription(text)
+    raw_text = transcript.text.lower()
+    cleaned = clean_transcript(raw_text)
 
-    for s in subscribers:
-        if s.get("email"):
-            send_email(
-                s["email"],
-                "Today's Color Code Announcement",
-                text,
-            )
+    send_email(cleaned)
 
-# -------------------------------------------------
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    return ("ok", 200)
+
+# --------------------
+# CLEAN TRANSCRIPT
+# --------------------
+def clean_transcript(text):
+    words = text.replace(",", " ").split()
+    detected = sorted({w for w in words if w in KNOWN_COLORS})
+
+    if "no" in words and "called" in words:
+        return "No colors are being called today."
+
+    if detected:
+        return f"Colors called today: {', '.join(detected)}"
+
+    return "Color announcement could not be confidently confirmed."
+
+# --------------------
+# EMAIL
+# --------------------
+def send_email(body):
+    # Your existing email logic here
+    print("EMAIL CONTENT:")
+    print(body)
+
+# --------------------
+# HEALTH
+# --------------------
+@app.route("/")
+def health():
+    return "OK", 200
