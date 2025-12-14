@@ -3,12 +3,12 @@ import json
 from datetime import datetime, timezone
 
 from flask import Flask, request, Response, jsonify
-
 from twilio.rest import Client as TwilioClient
-from openai import OpenAI
 
 import gspread
 from google.oauth2.service_account import Credentials
+
+import openai
 
 
 # ------------------------
@@ -36,7 +36,8 @@ APP_BASE_URL = os.environ["APP_BASE_URL"].rstrip("/")
 # Clients
 # ------------------------
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+openai.api_key = OPENAI_API_KEY
 
 google_creds = Credentials.from_service_account_info(
     json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
@@ -44,7 +45,6 @@ google_creds = Credentials.from_service_account_info(
 )
 gc = gspread.authorize(google_creds)
 
-# IMPORTANT: exact tab name
 TRANSCRIPT_SHEET_NAME = "DailyTranscriptions"
 
 
@@ -71,7 +71,7 @@ def daily_call():
 
 
 # ------------------------
-# TwiML that records ONCE
+# TwiML — record ONCE
 # ------------------------
 @app.route("/twiml/dial_color_line", methods=["POST"])
 def dial_color_line():
@@ -103,22 +103,23 @@ def recording_complete():
 
     audio_url = f"{recording_url}.wav"
 
-    # ---- Transcribe with OpenAI ----
-    transcription = openai_client.audio.transcriptions.create(
+    # ---- Transcription (legacy OpenAI call — stable on Render) ----
+    transcription_result = openai.Audio.transcribe(
+        model="whisper-1",
         file=audio_url,
-        model="gpt-4o-transcribe",
-    ).text.strip()
+    )
+    transcription = transcription_result["text"].strip()
 
-    # ---- Very simple color extraction ----
-    colors = []
+    # ---- Color detection ----
+    detected = []
     for color in [
         "red", "blue", "green", "yellow", "orange",
         "white", "black", "purple", "brown", "gray"
     ]:
         if color in transcription.lower():
-            colors.append(color)
+            detected.append(color)
 
-    colors_detected = ", ".join(colors) if colors else "none"
+    colors_detected = ", ".join(detected) if detected else "none"
 
     # ---- Write to Google Sheet ----
     sheet = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(TRANSCRIPT_SHEET_NAME)
@@ -137,7 +138,7 @@ def recording_complete():
 
 
 # ------------------------
-# Run locally (Render ignores this)
+# Local run
 # ------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
