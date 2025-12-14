@@ -1,15 +1,13 @@
 import os
 import logging
+import requests
 from datetime import datetime, timezone
 
 from flask import Flask, request, Response, jsonify
 from twilio.rest import Client
-from openai import OpenAI
+import openai
 
-from sheets import (
-    get_latest_transcription,
-    save_daily_transcription,
-)
+from sheets import get_latest_transcription, save_daily_transcription
 from emailer import send_email
 
 
@@ -31,15 +29,15 @@ if missing:
     logging.error(f"Missing env vars: {missing}")
     raise RuntimeError("Missing required environment variables")
 
+openai.api_key = os.environ["OPENAI_API_KEY"]
+
 twilio_client = Client(
     os.environ["TWILIO_ACCOUNT_SID"],
     os.environ["TWILIO_AUTH_TOKEN"],
 )
 
-openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-
-def today_utc_str():
+def today_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
@@ -53,7 +51,7 @@ def health():
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
     last_date, _ = get_latest_transcription()
-    if last_date == today_utc_str():
+    if last_date == today_utc():
         logging.info("Already transcribed today — skipping call")
         return jsonify({"status": "skipped"}), 200
 
@@ -70,22 +68,18 @@ def daily_call():
 
 @app.route("/twiml/record", methods=["POST"])
 def twiml_record():
-    xml = """<?xml version="1.0" encoding="UTF-8"?>
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Record
     maxLength="120"
     playBeep="false"
     trim="trim-silence"
-    recordingStatusCallback="{callback}"
+    recordingStatusCallback="{request.url_root.rstrip('/')}/twilio/recording-complete"
     recordingStatusCallbackMethod="POST"
-    recordingStatusCallbackEvent="completed"
   />
   <Hangup/>
 </Response>
-""".format(
-        callback=f"{request.url_root.rstrip('/')}/twilio/recording-complete"
-    )
-
+"""
     return Response(xml, mimetype="text/xml")
 
 
@@ -98,12 +92,23 @@ def recording_complete():
 
     audio_url = f"{recording_url}.wav"
 
-    transcript = openai_client.audio.transcriptions.create(
-        file=openai_client.files.retrieve_content(audio_url),
-        model="gpt-4o-transcribe",
-    ).text
+    audio_response = requests.get(
+        audio_url,
+        auth=(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"]),
+        timeout=30,
+    )
+    audio_response.raise_for_status()
 
-    today = today_utc_str()
+    with open("/tmp/audio.wav", "wb") as f:
+        f.write(audio_response.content)
+
+    with open("/tmp/audio.wav", "rb") as audio_file:
+        transcript = openai.audio.transcriptions.create(
+            file=audio_file,
+            model="gpt-4o-transcribe",
+        ).text
+
+    today = today_utc()
     save_daily_transcription(transcript, today)
 
     send_email(
@@ -111,7 +116,7 @@ def recording_complete():
         body=transcript,
     )
 
-    logging.info("Transcription saved and emailed")
+    logging.info("Transcription saved and emailed successfully")
     return "", 204
 
 
