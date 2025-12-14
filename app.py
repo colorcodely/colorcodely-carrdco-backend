@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime, date
+from datetime import date
 
 from flask import Flask, request, Response, jsonify
 from twilio.rest import Client
@@ -9,37 +9,9 @@ import requests
 from sheets import save_daily_transcription, get_latest_transcription
 from emailer import send_email
 
-# --------------------------------------------------
-# Basic setup
-# --------------------------------------------------
-
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# --------------------------------------------------
-# Environment variables (NO guessing)
-# --------------------------------------------------
-
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
-TWILIO_TO_NUMBER = os.environ.get("TWILIO_TO_NUMBER")
-APP_BASE_URL = os.environ.get("APP_BASE_URL")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-
-REQUIRED_VARS = [
-    TWILIO_ACCOUNT_SID,
-    TWILIO_AUTH_TOKEN,
-    TWILIO_FROM_NUMBER,
-    TWILIO_TO_NUMBER,
-    APP_BASE_URL,
-    OPENAI_API_KEY,
-]
-
-if not all(REQUIRED_VARS):
-    raise RuntimeError("Missing required environment variables")
-
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # --------------------------------------------------
 # Helpers
@@ -54,13 +26,23 @@ def already_transcribed_today():
     return last_date == today_str()
 
 
-def transcribe_with_whisper(recording_url: str) -> str:
-    """
-    Fetch Twilio recording and send to OpenAI Whisper.
-    """
+def get_required_env():
+    vars = {
+        "TWILIO_ACCOUNT_SID": os.environ.get("TWILIO_ACCOUNT_SID"),
+        "TWILIO_AUTH_TOKEN": os.environ.get("TWILIO_AUTH_TOKEN"),
+        "TWILIO_FROM_NUMBER": os.environ.get("TWILIO_FROM_NUMBER"),
+        "TWILIO_TO_NUMBER": os.environ.get("TWILIO_TO_NUMBER"),
+        "APP_BASE_URL": os.environ.get("APP_BASE_URL"),
+        "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
+    }
+    missing = [k for k, v in vars.items() if not v]
+    return vars, missing
+
+
+def transcribe_with_whisper(recording_url, env):
     audio = requests.get(
         recording_url,
-        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+        auth=(env["TWILIO_ACCOUNT_SID"], env["TWILIO_AUTH_TOKEN"]),
         timeout=30,
     )
 
@@ -68,7 +50,7 @@ def transcribe_with_whisper(recording_url: str) -> str:
         raise RuntimeError("Failed to download recording")
 
     import openai
-    openai.api_key = OPENAI_API_KEY
+    openai.api_key = env["OPENAI_API_KEY"]
 
     response = openai.audio.transcriptions.create(
         file=("audio.wav", audio.content),
@@ -83,34 +65,40 @@ def transcribe_with_whisper(recording_url: str) -> str:
 # --------------------------------------------------
 
 @app.route("/", methods=["GET"])
-def health_check():
+def health():
     return "OK", 200
 
 
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
+    env, missing = get_required_env()
+    if missing:
+        logging.error(f"Missing env vars: {missing}")
+        return jsonify({"error": "Missing environment variables"}), 500
+
     if already_transcribed_today():
-        logging.info("Transcription already exists for today — skipping call.")
+        logging.info("Already transcribed today — skipping call")
         return jsonify({"status": "skipped"}), 200
 
-    call = twilio_client.calls.create(
-        to=TWILIO_TO_NUMBER,
-        from_=TWILIO_FROM_NUMBER,
-        url=f"{APP_BASE_URL}/twiml/record",
+    twilio = Client(env["TWILIO_ACCOUNT_SID"], env["TWILIO_AUTH_TOKEN"])
+
+    call = twilio.calls.create(
+        to=env["TWILIO_TO_NUMBER"],
+        from_=env["TWILIO_FROM_NUMBER"],
+        url=f"{env['APP_BASE_URL']}/twiml/record",
         timeout=55,
     )
 
-    logging.info(f"Call initiated: {call.sid}")
-    return jsonify({"status": "calling", "call_sid": call.sid}), 200
+    logging.info(f"Call started: {call.sid}")
+    return jsonify({"call_sid": call.sid}), 200
 
 
 @app.route("/twiml/record", methods=["POST"])
 def twiml_record():
-    """
-    Single-shot recording. No looping.
-    """
+    callback = f"{os.environ.get('APP_BASE_URL')}/twilio/recording-complete"
+
     return Response(
-        """<?xml version="1.0" encoding="UTF-8"?>
+        f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Record
         maxLength="120"
@@ -121,50 +109,45 @@ def twiml_record():
     />
     <Hangup/>
 </Response>
-""".format(
-            callback=f"{APP_BASE_URL}/twilio/recording-complete"
-        ),
+""",
         mimetype="text/xml",
     )
 
 
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
+    env, missing = get_required_env()
+    if missing:
+        logging.error(f"Missing env vars at callback: {missing}")
+        return ("", 500)
+
     if already_transcribed_today():
-        logging.info("Recording callback ignored — already transcribed today.")
+        logging.info("Callback ignored — already processed today")
         return ("", 204)
 
     recording_url = request.form.get("RecordingUrl")
-    call_sid = request.form.get("CallSid")
-
     if not recording_url:
-        logging.error("No RecordingUrl received")
+        logging.error("RecordingUrl missing")
         return ("", 400)
 
     try:
-        transcription = transcribe_with_whisper(recording_url)
-    except Exception as e:
-        logging.exception("Transcription failed")
+        transcription = transcribe_with_whisper(recording_url, env)
+        save_daily_transcription(transcription)
         send_email(
-            subject="ColorCodeLy — Transcription Failed",
+            subject=f"Color Codes for {today_str()}",
+            body=transcription,
+        )
+        logging.info("Transcription saved and emailed")
+    except Exception as e:
+        logging.exception("Processing failed")
+        send_email(
+            subject="ColorCodeLy Error",
             body=str(e),
         )
         return ("", 500)
 
-    save_daily_transcription(transcription)
-
-    send_email(
-        subject=f"Color Codes for {today_str()}",
-        body=transcription,
-    )
-
-    logging.info(f"Transcription saved for call {call_sid}")
     return ("", 204)
 
-
-# --------------------------------------------------
-# Entrypoint (Render/Gunicorn)
-# --------------------------------------------------
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
