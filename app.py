@@ -2,7 +2,7 @@ import os
 import logging
 import tempfile
 import requests
-from datetime import datetime
+from datetime import datetime, date
 
 from flask import Flask, request, Response
 from twilio.rest import Client as TwilioClient
@@ -45,7 +45,7 @@ twilio_client = TwilioClient(TWILIO_SID, TWILIO_AUTH)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -------------------------------------------------
-# Google Sheets
+# Google Sheets helpers
 # -------------------------------------------------
 def get_sheet():
     creds_dict = eval(GOOGLE_CREDS_JSON)
@@ -55,15 +55,27 @@ def get_sheet():
     sheet = client.open_by_key(GOOGLE_SHEET_ID)
     return sheet.worksheet("DailyTranscriptions")
 
+def already_transcribed_today():
+    sheet = get_sheet()
+    rows = sheet.get_all_values()
+    if not rows:
+        return False
+
+    last_row = rows[-1]
+    if not last_row:
+        return False
+
+    return last_row[0] == date.today().strftime("%Y-%m-%d")
+
 # -------------------------------------------------
 # Email
 # -------------------------------------------------
-def send_email(recording_url):
+def send_email(transcription_text):
     msg = EmailMessage()
-    msg["Subject"] = "Daily Color Code Recording"
+    msg["Subject"] = "Daily Color Code Announcement"
     msg["From"] = EMAIL_USER
     msg["To"] = EMAIL_TO
-    msg.set_content(f"Recording URL:\n{recording_url}")
+    msg.set_content(transcription_text)
 
     with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT) as server:
         server.login(EMAIL_USER, EMAIL_PASS)
@@ -78,49 +90,55 @@ def home():
 
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
+    if already_transcribed_today():
+        logging.info("Daily transcription already exists — skipping call")
+        return {"status": "skipped"}, 200
+
     call = twilio_client.calls.create(
         to=TWILIO_TO,
         from_=TWILIO_FROM,
-        url="https://colorcodely-carrdco-backend.onrender.com/twiml/dial_color_line",
-        timeout=55
+        url="https://colorcodely-carrdco-backend.onrender.com/twiml/start",
+        timeout=60
     )
-    logging.info(f"Started call SID {call.sid}")
-    return {"call_sid": call.sid, "status": "started"}, 200
 
-@app.route("/twiml/dial_color_line", methods=["POST"])
-def dial_color_line():
+    logging.info(f"Started daily call {call.sid}")
+    return {"call_sid": call.sid}, 200
+
+# -------------------------------------------------
+# TwiML — ONE-SHOT RECORDING
+# -------------------------------------------------
+@app.route("/twiml/start", methods=["POST"])
+def twiml_start():
     return Response(
         """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Record
-        maxLength="90"
-        playBeep="false"
-        recordingStatusCallback="https://colorcodely-carrdco-backend.onrender.com/twilio/recording-complete"
-        recordingStatusCallbackMethod="POST"
-        trim="trim-silence"
-    />
-    <Hangup/>
+  <Dial timeLimit="70">
+    <Number>+12564277808</Number>
+  </Dial>
 </Response>
 """,
         mimetype="text/xml",
     )
 
+# -------------------------------------------------
+# Recording webhook
+# -------------------------------------------------
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
-    logging.info("Recording complete webhook hit")
+    if already_transcribed_today():
+        logging.info("Duplicate recording callback ignored")
+        return ("", 204)
+
+    recording_url = request.form.get("RecordingUrl")
+    recording_sid = request.form.get("RecordingSid")
+
+    if not recording_url or not recording_sid:
+        logging.warning("Missing recording info")
+        return ("", 204)
+
+    logging.info(f"Processing recording {recording_sid}")
 
     try:
-        recording_url = request.form.get("RecordingUrl")
-        recording_sid = request.form.get("RecordingSid")
-        call_sid = request.form.get("CallSid")
-
-        if not recording_url or not recording_sid:
-            logging.warning("Missing recording data")
-            return ("", 204)
-
-        # -------------------------------------------------
-        # Download recording from Twilio
-        # -------------------------------------------------
         audio_response = requests.get(
             recording_url + ".wav",
             auth=(TWILIO_SID, TWILIO_AUTH),
@@ -128,47 +146,32 @@ def recording_complete():
         )
 
         if audio_response.status_code != 200:
-            logging.error("Failed to download recording")
-            return ("", 204)
+            raise RuntimeError("Failed to download audio")
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp.write(audio_response.content)
             audio_path = tmp.name
 
-        # -------------------------------------------------
-        # Transcribe with OpenAI (CORRECT v1 API)
-        # -------------------------------------------------
         with open(audio_path, "rb") as audio_file:
             transcript = openai_client.audio.transcriptions.create(
                 file=audio_file,
                 model="gpt-4o-transcribe"
             )
 
-        transcription_text = transcript.text.strip()
+        text = transcript.text.strip()
 
-        # -------------------------------------------------
-        # Write ONE row to Google Sheet
-        # -------------------------------------------------
+        today = date.today().strftime("%Y-%m-%d")
+        now = datetime.now().strftime("%H:%M:%S")
+
         sheet = get_sheet()
-        now = datetime.now()
-        sheet.append_row([
-            now.strftime("%Y-%m-%d"),
-            now.strftime("%H:%M:%S"),
-            call_sid,
-            "n/a",
-            "n/a",
-            transcription_text
-        ])
+        sheet.append_row([today, now, recording_sid, text])
 
-        # -------------------------------------------------
-        # Send ONE email
-        # -------------------------------------------------
-        send_email(recording_url)
+        send_email(text)
 
-        logging.info("Recording processed successfully")
+        logging.info("Daily transcription complete")
 
     except Exception:
-        logging.exception("Fatal error in recording-complete")
+        logging.exception("Transcription failure")
 
     return ("", 204)
 
