@@ -1,153 +1,170 @@
 import os
-import datetime
 import logging
+from datetime import datetime, date
+
+from flask import Flask, request, Response, jsonify
+from twilio.rest import Client
 import requests
-from flask import Flask, request, abort, jsonify
-from twilio.rest import Client as TwilioClient
 
-# --- local modules (unchanged, as requested) ---
+from sheets import save_daily_transcription, get_latest_transcription
 from emailer import send_email
-from sheets import append_transcription_row
 
-# -------------------------------------------------
-# Basic app setup
-# -------------------------------------------------
+# --------------------------------------------------
+# Basic setup
+# --------------------------------------------------
+
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# -------------------------------------------------
-# Environment variables (match your existing names)
-# -------------------------------------------------
+# --------------------------------------------------
+# Environment variables (NO guessing)
+# --------------------------------------------------
+
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
 TWILIO_TO_NUMBER = os.environ.get("TWILIO_TO_NUMBER")
 APP_BASE_URL = os.environ.get("APP_BASE_URL")
-
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-if not all([
+REQUIRED_VARS = [
     TWILIO_ACCOUNT_SID,
     TWILIO_AUTH_TOKEN,
     TWILIO_FROM_NUMBER,
     TWILIO_TO_NUMBER,
     APP_BASE_URL,
     OPENAI_API_KEY,
-]):
+]
+
+if not all(REQUIRED_VARS):
     raise RuntimeError("Missing required environment variables")
 
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# -------------------------------------------------
-# Simple in-memory guard (Render restarts daily)
-# -------------------------------------------------
-LAST_RUN_DATE = None
-
-# -------------------------------------------------
+# --------------------------------------------------
 # Helpers
-# -------------------------------------------------
-def today_cst():
-    return datetime.datetime.utcnow() - datetime.timedelta(hours=6)
+# --------------------------------------------------
 
-def already_ran_today():
-    global LAST_RUN_DATE
-    today = today_cst().date()
-    return LAST_RUN_DATE == today
+def today_str():
+    return date.today().strftime("%Y-%m-%d")
 
-def mark_ran_today():
-    global LAST_RUN_DATE
-    LAST_RUN_DATE = today_cst().date()
 
-def whisper_transcribe(recording_url):
+def already_transcribed_today():
+    last_date, _ = get_latest_transcription()
+    return last_date == today_str()
+
+
+def transcribe_with_whisper(recording_url: str) -> str:
+    """
+    Fetch Twilio recording and send to OpenAI Whisper.
+    """
     audio = requests.get(
         recording_url,
         auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
         timeout=30,
     )
 
-    r = requests.post(
-        "https://api.openai.com/v1/audio/transcriptions",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-        },
-        files={
-            "file": ("audio.wav", audio.content, "audio/wav"),
-            "model": (None, "whisper-1"),
-        },
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.json().get("text", "")
+    if audio.status_code != 200:
+        raise RuntimeError("Failed to download recording")
 
-# -------------------------------------------------
+    import openai
+    openai.api_key = OPENAI_API_KEY
+
+    response = openai.audio.transcriptions.create(
+        file=("audio.wav", audio.content),
+        model="gpt-4o-transcribe",
+    )
+
+    return response.text.strip()
+
+
+# --------------------------------------------------
 # Routes
-# -------------------------------------------------
+# --------------------------------------------------
+
 @app.route("/", methods=["GET"])
-def health():
-    return "ok", 200
+def health_check():
+    return "OK", 200
+
 
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
-    if already_ran_today():
+    if already_transcribed_today():
+        logging.info("Transcription already exists for today — skipping call.")
         return jsonify({"status": "skipped"}), 200
 
     call = twilio_client.calls.create(
         to=TWILIO_TO_NUMBER,
         from_=TWILIO_FROM_NUMBER,
-        url=f"{APP_BASE_URL}/twiml/dial_color_line",
+        url=f"{APP_BASE_URL}/twiml/record",
         timeout=55,
     )
 
-    mark_ran_today()
-    return jsonify({"call_sid": call.sid}), 200
+    logging.info(f"Call initiated: {call.sid}")
+    return jsonify({"status": "calling", "call_sid": call.sid}), 200
 
-@app.route("/twiml/dial_color_line", methods=["POST"])
-def dial_color_line():
-    return (
+
+@app.route("/twiml/record", methods=["POST"])
+def twiml_record():
+    """
+    Single-shot recording. No looping.
+    """
+    return Response(
         """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Record
-    maxLength="90"
-    playBeep="false"
-    trim="trim-silence"
-    recordingStatusCallback="{}/twilio/recording-complete"
-    recordingStatusCallbackMethod="POST"/>
-  <Hangup/>
-</Response>""".format(APP_BASE_URL),
-        200,
-        {"Content-Type": "text/xml"},
+    <Record
+        maxLength="120"
+        playBeep="false"
+        trim="trim-silence"
+        recordingStatusCallback="{callback}"
+        recordingStatusCallbackMethod="POST"
+    />
+    <Hangup/>
+</Response>
+""".format(
+            callback=f"{APP_BASE_URL}/twilio/recording-complete"
+        ),
+        mimetype="text/xml",
     )
+
 
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
+    if already_transcribed_today():
+        logging.info("Recording callback ignored — already transcribed today.")
+        return ("", 204)
+
     recording_url = request.form.get("RecordingUrl")
     call_sid = request.form.get("CallSid")
 
-    if not recording_url or not call_sid:
-        abort(400)
+    if not recording_url:
+        logging.error("No RecordingUrl received")
+        return ("", 400)
 
     try:
-        text = whisper_transcribe(recording_url)
+        transcription = transcribe_with_whisper(recording_url)
     except Exception as e:
-        logging.exception("Whisper failed")
-        text = "Transcription error"
+        logging.exception("Transcription failed")
+        send_email(
+            subject="ColorCodeLy — Transcription Failed",
+            body=str(e),
+        )
+        return ("", 500)
 
-    append_transcription_row(
-        date=today_cst().date().isoformat(),
-        time=today_cst().time().strftime("%H:%M:%S"),
-        call_sid=call_sid,
-        transcription=text,
-    )
+    save_daily_transcription(transcription)
 
     send_email(
-        subject="Daily Color Code Transcription",
-        body=text or "No transcription text was provided.",
+        subject=f"Color Codes for {today_str()}",
+        body=transcription,
     )
 
+    logging.info(f"Transcription saved for call {call_sid}")
     return ("", 204)
 
-# -------------------------------------------------
-# Entrypoint
-# -------------------------------------------------
+
+# --------------------------------------------------
+# Entrypoint (Render/Gunicorn)
+# --------------------------------------------------
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(host="0.0.0.0", port=10000)
