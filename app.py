@@ -2,12 +2,12 @@ import os
 import logging
 import tempfile
 import requests
-from datetime import datetime, date
+from datetime import date
 
 from flask import Flask, request, Response, jsonify
 from twilio.rest import Client as TwilioClient
-from openai import OpenAI
 
+import openai
 import sheets
 import emailer
 
@@ -24,20 +24,19 @@ TWILIO_SID = os.environ.get("TWILIO_SID")
 TWILIO_AUTH = os.environ.get("TWILIO_AUTH")
 TWILIO_FROM = os.environ.get("TWILIO_FROM")
 TWILIO_TO = os.environ.get("TWILIO_TO")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+openai.api_key = os.environ.get("OPENAI_API_KEY")
 
 # -------------------------------------------------
 # Clients
 # -------------------------------------------------
 twilio_client = TwilioClient(TWILIO_SID, TWILIO_AUTH)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -------------------------------------------------
-# In-memory daily guards
-# (safe for single Render instance + daily cron)
+# Guards
 # -------------------------------------------------
-LAST_TRANSCRIPTION_DATE = None
 PROCESSED_RECORDINGS = set()
+LAST_TRANSCRIPTION_DATE = None
 
 # -------------------------------------------------
 # Routes
@@ -55,7 +54,7 @@ def daily_call():
         url="https://colorcodely-carrdco-backend.onrender.com/twiml/dial_color_line",
         timeout=55,
     )
-    logging.info(f"Daily call started: {call.sid}")
+    logging.info(f"Call started: {call.sid}")
     return jsonify({"call_sid": call.sid}), 200
 
 
@@ -84,28 +83,21 @@ def recording_complete():
 
     recording_sid = request.form.get("RecordingSid")
     recording_url = request.form.get("RecordingUrl")
-    call_sid = request.form.get("CallSid")
 
     if not recording_sid or not recording_url:
-        logging.warning("Recording callback missing data")
         return ("", 204)
 
-    # One-shot guard per recording
     if recording_sid in PROCESSED_RECORDINGS:
-        logging.info(f"Recording {recording_sid} already processed")
+        return ("", 204)
+
+    today = date.today()
+
+    if LAST_TRANSCRIPTION_DATE == today:
         return ("", 204)
 
     PROCESSED_RECORDINGS.add(recording_sid)
 
-    today = date.today()
-
-    # One transcription per day guard
-    if LAST_TRANSCRIPTION_DATE == today:
-        logging.info("Daily transcription already completed — skipping")
-        return ("", 204)
-
     try:
-        # Download audio
         audio_resp = requests.get(
             recording_url + ".wav",
             auth=(TWILIO_SID, TWILIO_AUTH),
@@ -113,39 +105,38 @@ def recording_complete():
         )
 
         if audio_resp.status_code != 200:
-            logging.error("Failed to download Twilio recording")
             return ("", 204)
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp.write(audio_resp.content)
             audio_path = tmp.name
 
-        # Transcribe
         with open(audio_path, "rb") as audio_file:
-            transcript = openai_client.audio.transcriptions.create(
+            transcript = openai.Audio.transcribe(
+                model="whisper-1",
                 file=audio_file,
-                model="gpt-4o-transcribe",
+                prompt=(
+                    "This is a daily color code announcement. "
+                    "Colors are spoken clearly and separated by commas."
+                ),
             )
 
-        transcription_text = transcript.text.strip()
+        transcription_text = transcript["text"].strip()
 
-        # Persist
         sheets.save_daily_transcription(transcription_text)
 
-        # Email (forced once)
-        subject = f"Daily Color Code – {today.strftime('%B %d, %Y')}"
         emailer.send_email(
             to_email=os.environ.get("ALERT_EMAIL", ""),
-            subject=subject,
+            subject=f"Daily Color Code – {today.strftime('%B %d, %Y')}",
             body=transcription_text,
         )
 
         LAST_TRANSCRIPTION_DATE = today
 
-        logging.info("Daily transcription + email completed")
+        logging.info("Daily transcription complete")
 
     except Exception:
-        logging.exception("Fatal error processing recording")
+        logging.exception("Recording processing failed")
 
     return ("", 204)
 
