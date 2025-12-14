@@ -1,144 +1,180 @@
 import os
-import json
-import datetime
 import logging
+import tempfile
 import requests
-import smtplib
+from datetime import datetime
 
-from flask import Flask, request, Response, jsonify
-from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse
+from flask import Flask, request, Response
+from twilio.rest import Client as TwilioClient
+from openai import OpenAI
 
 import gspread
 from google.oauth2.service_account import Credentials
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import smtplib
+from email.message import EmailMessage
 
-# -------------------------
-# APP SETUP
-# -------------------------
-
-app = Flask(__name__)
+# -------------------------------------------------
+# Basic setup
+# -------------------------------------------------
 logging.basicConfig(level=logging.INFO)
+app = Flask(__name__)
 
-# -------------------------
-# ENV VARS
-# -------------------------
+# -------------------------------------------------
+# Environment variables
+# -------------------------------------------------
+TWILIO_SID = os.environ["TWILIO_SID"]
+TWILIO_AUTH = os.environ["TWILIO_AUTH"]
+TWILIO_FROM = os.environ["TWILIO_FROM"]
+TWILIO_TO = os.environ["TWILIO_TO"]
 
-TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
-APP_BASE_URL = os.environ["APP_BASE_URL"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 
-SMTP_SERVER = os.environ["SMTP_SERVER"]
-SMTP_PORT = int(os.environ["SMTP_PORT"])
-SMTP_USERNAME = os.environ["SMTP_USERNAME"]
-SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
-SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
-SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
+EMAIL_HOST = os.environ["EMAIL_HOST"]
+EMAIL_PORT = int(os.environ["EMAIL_PORT"])
+EMAIL_USER = os.environ["EMAIL_USER"]
+EMAIL_PASS = os.environ["EMAIL_PASS"]
+EMAIL_TO = os.environ["EMAIL_TO"]
 
-# -------------------------
-# CLIENTS
-# -------------------------
+# -------------------------------------------------
+# Clients
+# -------------------------------------------------
+twilio_client = TwilioClient(TWILIO_SID, TWILIO_AUTH)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+# -------------------------------------------------
+# Google Sheets
+# -------------------------------------------------
+def get_sheet():
+    creds_dict = eval(GOOGLE_CREDS_JSON)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(GOOGLE_SHEET_ID)
+    return sheet.worksheet("DailyTranscriptions")
 
-def get_sheets():
-    creds = Credentials.from_service_account_info(
-        json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(GOOGLE_SHEET_ID)
+# -------------------------------------------------
+# Email
+# -------------------------------------------------
+def send_email(recording_url):
+    msg = EmailMessage()
+    msg["Subject"] = "Daily Color Code Recording"
+    msg["From"] = EMAIL_USER
+    msg["To"] = EMAIL_TO
+    msg.set_content(f"Recording URL:\n{recording_url}")
 
-# -------------------------
-# ROUTES
-# -------------------------
+    with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT) as server:
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.send_message(msg)
 
-@app.route("/", methods=["GET", "HEAD"])
-def health():
+# -------------------------------------------------
+# Routes
+# -------------------------------------------------
+@app.route("/")
+def home():
     return "OK", 200
 
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
     call = twilio_client.calls.create(
-        to="+12564277808",
-        from_=TWILIO_FROM_NUMBER,
-        url=f"{APP_BASE_URL}/twiml/dial_color_line",
+        to=TWILIO_TO,
+        from_=TWILIO_FROM,
+        url="https://colorcodely-carrdco-backend.onrender.com/twiml/dial_color_line",
         timeout=55
     )
-    logging.info(f"Call started: {call.sid}")
-    return jsonify({"call_sid": call.sid, "status": "started"}), 200
+    logging.info(f"Started call SID {call.sid}")
+    return {"call_sid": call.sid, "status": "started"}, 200
 
 @app.route("/twiml/dial_color_line", methods=["POST"])
 def dial_color_line():
-    vr = VoiceResponse()
-    vr.record(
-        max_length=90,
-        play_beep=False,
-        trim="trim-silence",
-        recording_status_callback=f"{APP_BASE_URL}/twilio/recording-complete",
-        recording_status_callback_method="POST"
+    return Response(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Record
+        maxLength="90"
+        playBeep="false"
+        recordingStatusCallback="https://colorcodely-carrdco-backend.onrender.com/twilio/recording-complete"
+        recordingStatusCallbackMethod="POST"
+        trim="trim-silence"
+    />
+    <Hangup/>
+</Response>
+""",
+        mimetype="text/xml",
     )
-    vr.hangup()
-    return Response(str(vr), mimetype="text/xml")
 
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
+    logging.info("Recording complete webhook hit")
+
     try:
-        logging.info("Recording webhook received")
-
-        call_sid = request.form.get("CallSid")
-        recording_sid = request.form.get("RecordingSid")
         recording_url = request.form.get("RecordingUrl")
+        recording_sid = request.form.get("RecordingSid")
+        call_sid = request.form.get("CallSid")
 
-        now = datetime.datetime.now()
-        date_str = now.strftime("%Y-%m-%d")
-        time_str = now.strftime("%H:%M:%S")
+        if not recording_url or not recording_sid:
+            logging.warning("Missing recording data")
+            return ("", 204)
 
-        sheet = get_sheets()
-        daily = sheet.worksheet("DailyTranscriptions")
+        # -------------------------------------------------
+        # Download recording from Twilio
+        # -------------------------------------------------
+        audio_response = requests.get(
+            recording_url + ".wav",
+            auth=(TWILIO_SID, TWILIO_AUTH),
+            timeout=30
+        )
 
-        daily.append_row([
-            date_str,
-            time_str,
-            call_sid,
-            recording_sid,
-            "n/a",
-            recording_url
-        ])
+        if audio_response.status_code != 200:
+            logging.error("Failed to download recording")
+            return ("", 204)
 
-        logging.info("Row written to Google Sheets")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(audio_response.content)
+            audio_path = tmp.name
 
-        subscribers = sheet.worksheet("Subscribers").get_all_records()
-        for sub in subscribers:
-            send_email(
-                sub["email"],
-                "Daily Color Code Recording",
-                f"Recording URL:\n{recording_url}"
+        # -------------------------------------------------
+        # Transcribe with OpenAI (CORRECT v1 API)
+        # -------------------------------------------------
+        with open(audio_path, "rb") as audio_file:
+            transcript = openai_client.audio.transcriptions.create(
+                file=audio_file,
+                model="gpt-4o-transcribe"
             )
 
-        return Response(status=204)
+        transcription_text = transcript.text.strip()
+
+        # -------------------------------------------------
+        # Write ONE row to Google Sheet
+        # -------------------------------------------------
+        sheet = get_sheet()
+        now = datetime.now()
+        sheet.append_row([
+            now.strftime("%Y-%m-%d"),
+            now.strftime("%H:%M:%S"),
+            call_sid,
+            "n/a",
+            "n/a",
+            transcription_text
+        ])
+
+        # -------------------------------------------------
+        # Send ONE email
+        # -------------------------------------------------
+        send_email(recording_url)
+
+        logging.info("Recording processed successfully")
 
     except Exception:
-        logging.exception("Recording handler failed")
-        return Response(status=204)
+        logging.exception("Fatal error in recording-complete")
 
-# -------------------------
-# EMAIL
-# -------------------------
+    return ("", 204)
 
-def send_email(to_email, subject, body):
-    msg = MIMEMultipart()
-    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(msg)
+# -------------------------------------------------
+# Entrypoint
+# -------------------------------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
