@@ -20,23 +20,32 @@ logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
 # -------------------------------------------------
-# Environment variables
+# Environment variables (SAFE)
 # -------------------------------------------------
-TWILIO_SID = os.environ["TWILIO_SID"]
-TWILIO_AUTH = os.environ["TWILIO_AUTH"]
-TWILIO_FROM = os.environ["TWILIO_FROM"]
-TWILIO_TO = os.environ["TWILIO_TO"]
+TWILIO_SID = os.getenv("TWILIO_SID") or os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH = os.getenv("TWILIO_AUTH") or os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM = os.getenv("TWILIO_FROM") or os.getenv("TWILIO_FROM_NUMBER")
+TWILIO_TO = os.getenv("TWILIO_TO")
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 
-EMAIL_HOST = os.environ["EMAIL_HOST"]
-EMAIL_PORT = int(os.environ["EMAIL_PORT"])
-EMAIL_USER = os.environ["EMAIL_USER"]
-EMAIL_PASS = os.environ["EMAIL_PASS"]
-EMAIL_TO = os.environ["EMAIL_TO"]
+EMAIL_HOST = os.getenv("EMAIL_HOST")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "465"))
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+EMAIL_TO = os.getenv("EMAIL_TO")
+
+# -------------------------------------------------
+# Validate critical config
+# -------------------------------------------------
+if not all([TWILIO_SID, TWILIO_AUTH, TWILIO_FROM, TWILIO_TO]):
+    logging.warning("⚠️ Twilio environment variables incomplete")
+
+if not OPENAI_API_KEY:
+    logging.warning("⚠️ OpenAI API key missing")
 
 # -------------------------------------------------
 # Clients
@@ -60,22 +69,21 @@ def already_transcribed_today():
     rows = sheet.get_all_values()
     if not rows:
         return False
-
-    last_row = rows[-1]
-    if not last_row:
-        return False
-
-    return last_row[0] == date.today().strftime("%Y-%m-%d")
+    return rows[-1][0] == date.today().strftime("%Y-%m-%d")
 
 # -------------------------------------------------
 # Email
 # -------------------------------------------------
-def send_email(transcription_text):
+def send_email(text):
+    if not all([EMAIL_HOST, EMAIL_USER, EMAIL_PASS, EMAIL_TO]):
+        logging.warning("Email not configured — skipping send")
+        return
+
     msg = EmailMessage()
     msg["Subject"] = "Daily Color Code Announcement"
     msg["From"] = EMAIL_USER
     msg["To"] = EMAIL_TO
-    msg.set_content(transcription_text)
+    msg.set_content(text)
 
     with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT) as server:
         server.login(EMAIL_USER, EMAIL_PASS)
@@ -91,21 +99,21 @@ def home():
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
     if already_transcribed_today():
-        logging.info("Daily transcription already exists — skipping call")
+        logging.info("Already transcribed today — skipping call")
         return {"status": "skipped"}, 200
 
     call = twilio_client.calls.create(
         to=TWILIO_TO,
         from_=TWILIO_FROM,
         url="https://colorcodely-carrdco-backend.onrender.com/twiml/start",
-        timeout=60
+        timeout=70
     )
 
-    logging.info(f"Started daily call {call.sid}")
+    logging.info(f"Started call {call.sid}")
     return {"call_sid": call.sid}, 200
 
 # -------------------------------------------------
-# TwiML — ONE-SHOT RECORDING
+# TwiML (ONE-SHOT, NO LOOP)
 # -------------------------------------------------
 @app.route("/twiml/start", methods=["POST"])
 def twiml_start():
@@ -126,33 +134,25 @@ def twiml_start():
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
     if already_transcribed_today():
-        logging.info("Duplicate recording callback ignored")
+        logging.info("Duplicate recording ignored")
         return ("", 204)
 
     recording_url = request.form.get("RecordingUrl")
-    recording_sid = request.form.get("RecordingSid")
-
-    if not recording_url or not recording_sid:
-        logging.warning("Missing recording info")
+    if not recording_url:
         return ("", 204)
 
-    logging.info(f"Processing recording {recording_sid}")
-
     try:
-        audio_response = requests.get(
+        audio = requests.get(
             recording_url + ".wav",
             auth=(TWILIO_SID, TWILIO_AUTH),
             timeout=30
         )
 
-        if audio_response.status_code != 200:
-            raise RuntimeError("Failed to download audio")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+            f.write(audio.content)
+            path = f.name
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp.write(audio_response.content)
-            audio_path = tmp.name
-
-        with open(audio_path, "rb") as audio_file:
+        with open(path, "rb") as audio_file:
             transcript = openai_client.audio.transcriptions.create(
                 file=audio_file,
                 model="gpt-4o-transcribe"
@@ -160,18 +160,18 @@ def recording_complete():
 
         text = transcript.text.strip()
 
-        today = date.today().strftime("%Y-%m-%d")
-        now = datetime.now().strftime("%H:%M:%S")
-
         sheet = get_sheet()
-        sheet.append_row([today, now, recording_sid, text])
+        sheet.append_row([
+            date.today().strftime("%Y-%m-%d"),
+            datetime.now().strftime("%H:%M:%S"),
+            text
+        ])
 
         send_email(text)
-
-        logging.info("Daily transcription complete")
+        logging.info("Transcription complete")
 
     except Exception:
-        logging.exception("Transcription failure")
+        logging.exception("Transcription failed")
 
     return ("", 204)
 
