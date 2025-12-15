@@ -1,26 +1,11 @@
 import os
 import logging
-import tempfile
 import requests
+import tempfile
 from datetime import datetime
 
 from flask import Flask, request, jsonify, Response
 from twilio.rest import Client as TwilioClient
-from openai import OpenAI
-
-import gspread
-from google.oauth2.service_account import Credentials
-
-# --------------------------------------------------
-# CRITICAL: Render / OpenAI proxy crash workaround
-# --------------------------------------------------
-for proxy_var in [
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "http_proxy",
-    "https_proxy",
-]:
-    os.environ.pop(proxy_var, None)
 
 # --------------------------------------------------
 # App + logging
@@ -29,64 +14,23 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # --------------------------------------------------
-# Environment variables (fail fast if missing)
+# Twilio client (ONLY dependency at runtime)
 # --------------------------------------------------
-REQUIRED_ENV_VARS = [
-    "TWILIO_ACCOUNT_SID",
-    "TWILIO_AUTH_TOKEN",
-    "TWILIO_FROM_NUMBER",
-    "TWILIO_TO_NUMBER",
-    "OPENAI_API_KEY",
-    "GOOGLE_SHEETS_CREDENTIALS_JSON",
-    "GOOGLE_SHEET_NAME",
-    "NOTIFY_EMAIL",
-]
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
+TWILIO_TO_NUMBER = os.environ.get("TWILIO_TO_NUMBER")
 
-missing = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
-if missing:
-    raise RuntimeError(f"Missing required env vars: {missing}")
+if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN]):
+    raise RuntimeError("Twilio credentials missing")
 
-# --------------------------------------------------
-# Clients
-# --------------------------------------------------
 twilio_client = TwilioClient(
-    os.environ["TWILIO_ACCOUNT_SID"],
-    os.environ["TWILIO_AUTH_TOKEN"]
-)
-
-openai_client = OpenAI(
-    api_key=os.environ["OPENAI_API_KEY"]
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN
 )
 
 # --------------------------------------------------
-# Google Sheets
-# --------------------------------------------------
-google_creds = Credentials.from_service_account_info(
-    eval(os.environ["GOOGLE_SHEETS_CREDENTIALS_JSON"]),
-    scopes=["https://www.googleapis.com/auth/spreadsheets"]
-)
-gc = gspread.authorize(google_creds)
-sheet = gc.open(os.environ["GOOGLE_SHEET_NAME"]).sheet1
-
-# --------------------------------------------------
-# Helpers
-# --------------------------------------------------
-def already_transcribed_today() -> bool:
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    values = sheet.get_all_values()
-    return any(row and row[0] == today for row in values[1:])
-
-def save_to_sheet(date_str, transcript, recording_url):
-    sheet.append_row([date_str, transcript, recording_url])
-
-def send_email(subject, body):
-    # Placeholder — you already wired this earlier
-    logging.info("EMAIL SENT")
-    logging.info(subject)
-    logging.info(body)
-
-# --------------------------------------------------
-# Routes
+# Health check
 # --------------------------------------------------
 @app.route("/", methods=["GET"])
 def health():
@@ -97,18 +41,15 @@ def health():
 # --------------------------------------------------
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
-    if already_transcribed_today():
-        logging.info("Already transcribed today — skipping call")
-        return jsonify({"status": "skipped"}), 200
-
     call = twilio_client.calls.create(
-        to=os.environ["TWILIO_TO_NUMBER"],
-        from_=os.environ["TWILIO_FROM_NUMBER"],
+        to=TWILIO_TO_NUMBER,
+        from_=TWILIO_FROM_NUMBER,
         url="https://colorcodely-carrdco-backend.onrender.com/twiml/record",
         timeout=55,
         trim="trim-silence"
     )
 
+    logging.info(f"Call started: {call.sid}")
     return jsonify({"call_sid": call.sid}), 200
 
 # --------------------------------------------------
@@ -133,54 +74,28 @@ def twiml_record():
     )
 
 # --------------------------------------------------
-# Recording complete → transcribe → store → notify
+# Recording complete (NO OpenAI here)
 # --------------------------------------------------
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
     recording_url = request.form.get("RecordingUrl")
+    call_sid = request.form.get("CallSid")
 
     if not recording_url:
-        logging.error("Missing RecordingUrl")
+        logging.error("Recording callback missing RecordingUrl")
         return "Missing RecordingUrl", 400
 
-    # Download audio
-    audio_response = requests.get(
-        recording_url + ".wav",
-        auth=(
-            os.environ["TWILIO_ACCOUNT_SID"],
-            os.environ["TWILIO_AUTH_TOKEN"]
-        ),
-        timeout=30
-    )
-    audio_response.raise_for_status()
+    logging.info("Recording completed")
+    logging.info(f"Call SID: {call_sid}")
+    logging.info(f"Recording URL: {recording_url}")
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        f.write(audio_response.content)
-        audio_path = f.name
-
-    # Transcription (CORRECT OpenAI SDK usage)
-    with open(audio_path, "rb") as audio_file:
-        transcription = openai_client.audio.transcriptions.create(
-            file=audio_file,
-            model="whisper-1"
-        )
-
-    transcript_text = transcription.text.strip()
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-
-    save_to_sheet(today, transcript_text, recording_url)
-
-    send_email(
-        subject=f"Daily Call Transcription — {today}",
-        body=transcript_text
-    )
-
-    logging.info("Transcription completed successfully")
-
+    # At this stage we only acknowledge receipt
+    # Transcription is handled OUTSIDE this service
     return "OK", 200
 
 # --------------------------------------------------
 # Entrypoint
 # --------------------------------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
