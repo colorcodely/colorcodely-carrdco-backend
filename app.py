@@ -1,101 +1,142 @@
 import os
 import logging
 import requests
-import tempfile
-from datetime import datetime
+from flask import Flask, request, Response, jsonify
+from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse, Record
 
-from flask import Flask, request, jsonify, Response
-from twilio.rest import Client as TwilioClient
-
-# --------------------------------------------------
-# App + logging
-# --------------------------------------------------
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# --------------------------------------------------
-# Twilio client (ONLY dependency at runtime)
-# --------------------------------------------------
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
-TWILIO_TO_NUMBER = os.environ.get("TWILIO_TO_NUMBER")
+# ======================
+# REQUIRED ENV VARS
+# ======================
+REQUIRED_ENV_VARS = [
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "TWILIO_FROM_NUMBER",
+    "TWILIO_TO_NUMBER",
+    "GITHUB_REPO",
+    "GH_ACTIONS_TOKEN",
+]
 
-if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN]):
-    raise RuntimeError("Twilio credentials missing")
+missing = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
+if missing:
+    raise RuntimeError(f"Missing required env vars: {missing}")
 
-twilio_client = TwilioClient(
-    TWILIO_ACCOUNT_SID,
-    TWILIO_AUTH_TOKEN
+# ======================
+# CLIENTS
+# ======================
+twilio_client = Client(
+    os.environ["TWILIO_ACCOUNT_SID"],
+    os.environ["TWILIO_AUTH_TOKEN"],
 )
 
-# --------------------------------------------------
-# Health check
-# --------------------------------------------------
+GITHUB_DISPATCH_URL = f"https://api.github.com/repos/{os.environ['GITHUB_REPO']}/dispatches"
+GITHUB_HEADERS = {
+    "Authorization": f"token {os.environ['GH_ACTIONS_TOKEN']}",
+    "Accept": "application/vnd.github+json",
+}
+
+
+# ======================
+# HEALTH CHECK
+# ======================
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
 
-# --------------------------------------------------
-# Trigger daily call
-# --------------------------------------------------
+
+# ======================
+# DAILY CALL TRIGGER
+# ======================
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
     call = twilio_client.calls.create(
-        to=TWILIO_TO_NUMBER,
-        from_=TWILIO_FROM_NUMBER,
-        url="https://colorcodely-carrdco-backend.onrender.com/twiml/record",
+        to=os.environ["TWILIO_TO_NUMBER"],
+        from_=os.environ["TWILIO_FROM_NUMBER"],
+        url=f"{request.host_url}twiml/record",
+        method="POST",
         timeout=55,
-        trim="trim-silence"
+        trim="trim-silence",
     )
 
     logging.info(f"Call started: {call.sid}")
     return jsonify({"call_sid": call.sid}), 200
 
-# --------------------------------------------------
-# TwiML: record audio
-# --------------------------------------------------
+
+# ======================
+# TWIML — RECORD ONCE
+# ======================
 @app.route("/twiml/record", methods=["POST"])
 def twiml_record():
-    return Response(
-        """
-        <Response>
-            <Record
-                maxLength="120"
-                playBeep="false"
-                trim="trim-silence"
-                recordingStatusCallback="https://colorcodely-carrdco-backend.onrender.com/twilio/recording-complete"
-                recordingStatusCallbackMethod="POST"
-            />
-            <Hangup/>
-        </Response>
-        """,
-        mimetype="text/xml"
-    )
+    """
+    IMPORTANT:
+    - Twilio may hit this endpoint multiple times
+    - We must only issue <Record> once
+    """
 
-# --------------------------------------------------
-# Recording complete (NO OpenAI here)
-# --------------------------------------------------
+    already_recorded = request.values.get("RecordingSid")
+
+    response = VoiceResponse()
+
+    if not already_recorded:
+        response.append(
+            Record(
+                maxLength=120,
+                playBeep=False,
+                trim="trim-silence",
+                recordingStatusCallback=f"{request.host_url}twilio/recording-complete",
+                recordingStatusCallbackMethod="POST",
+            )
+        )
+    else:
+        response.hangup()
+
+    return Response(str(response), mimetype="text/xml")
+
+
+# ======================
+# RECORDING COMPLETE
+# ======================
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
-    recording_url = request.form.get("RecordingUrl")
-    call_sid = request.form.get("CallSid")
+    recording_url = request.values.get("RecordingUrl")
+    call_sid = request.values.get("CallSid")
 
-    if not recording_url:
-        logging.error("Recording callback missing RecordingUrl")
-        return "Missing RecordingUrl", 400
+    if not recording_url or not call_sid:
+        logging.error("Missing RecordingUrl or CallSid")
+        return "", 400
 
     logging.info("Recording completed")
     logging.info(f"Call SID: {call_sid}")
     logging.info(f"Recording URL: {recording_url}")
 
-    # At this stage we only acknowledge receipt
-    # Transcription is handled OUTSIDE this service
-    return "OK", 200
+    payload = {
+        "event_type": "run-transcription",
+        "client_payload": {
+            "recording_url": recording_url,
+            "call_sid": call_sid,
+        },
+    }
 
-# --------------------------------------------------
-# Entrypoint
-# --------------------------------------------------
+    r = requests.post(
+        GITHUB_DISPATCH_URL,
+        headers=GITHUB_HEADERS,
+        json=payload,
+        timeout=15,
+    )
+
+    if r.status_code >= 300:
+        logging.error(f"GitHub dispatch failed: {r.status_code} {r.text}")
+    else:
+        logging.info("GitHub Actions transcription dispatched")
+
+    return "", 200
+
+
+# ======================
+# MAIN
+# ======================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
