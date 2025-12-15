@@ -1,15 +1,15 @@
-name: Transcribe Twilio Recording
+name: transcribe
 
 on:
   repository_dispatch:
-    types: [twilio-recording]
+    types: [twilio-call-complete]
 
 jobs:
   transcribe:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -22,14 +22,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 🔑 EXPORT VARIABLES EXPECTED BY transcribe_and_log.py
+      - name: Export Twilio payload variables
+        run: |
+          echo "RECORDING_URL=${{ github.event.client_payload.recording_url }}" >> $GITHUB_ENV
+          echo "CALL_SID=${{ github.event.client_payload.call_sid }}" >> $GITHUB_ENV
+
       - name: Run transcription worker
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          TWILIO_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
-          TWILIO_AUTH: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
-          RECORDING_URL: ${{ github.event.client_payload.recording_url }}
-          CALL_SID: ${{ github.event.client_payload.call_sid }}
-        run: |
-          python transcribe_and_log.py
+        run: python transcribe_and_log.py
