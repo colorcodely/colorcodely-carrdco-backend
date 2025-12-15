@@ -19,16 +19,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install openai requests google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run transcription
+      - name: Run transcription worker
         env:
-          RECORDING_URL: ${{ github.event.client_payload.recording_url }}
-          TWILIO_SID: ${{ secrets.TWILIO_SID }}
-          TWILIO_AUTH: ${{ secrets.TWILIO_AUTH }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          GOOGLE_SHEETS_CREDENTIALS_JSON: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          RECORDING_URL: ${{ github.event.client_payload.recording_url }}
+          CALL_SID: ${{ github.event.client_payload.call_sid }}
+
         run: |
-          python scripts/transcribe.py
+          python transcribe_and_log.py
