@@ -2,7 +2,7 @@ name: Transcribe Twilio Recording
 
 on:
   repository_dispatch:
-    types: [transcribe]
+    types: [twilio-recording]
 
 jobs:
   transcribe:
