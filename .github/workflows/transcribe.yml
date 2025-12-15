@@ -2,7 +2,7 @@ name: Transcribe Twilio Recording
 
 on:
   repository_dispatch:
-    types: [twilio-recording]
+    types: [run-transcription]
 
 jobs:
   transcribe:
@@ -35,19 +35,20 @@ jobs:
         run: |
           python << 'EOF'
           import os
-          import base64
           import requests
           from datetime import datetime
           from openai import OpenAI
           from google.oauth2.service_account import Credentials
           from googleapiclient.discovery import build
-          import smtplib
           from email.message import EmailMessage
+          import smtplib
 
           # --- ENV ---
           recording_url = os.environ["RECORDING_URL"]
           call_sid = os.environ["CALL_SID"]
           notify_email = os.environ["NOTIFY_EMAIL"]
+
+          print("Downloading recording:", recording_url)
 
           # --- DOWNLOAD RECORDING ---
           audio_response = requests.get(
@@ -60,7 +61,7 @@ jobs:
           with open(audio_path, "wb") as f:
               f.write(audio_response.content)
 
-          # --- TRANSCRIBE WITH OPENAI (WHISPER QUALITY) ---
+          # --- TRANSCRIBE WITH OPENAI ---
           client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
           with open(audio_path, "rb") as audio_file:
@@ -70,6 +71,7 @@ jobs:
               )
 
           text = transcript.text.strip()
+          print("Transcription complete")
 
           # --- WRITE TO GOOGLE SHEETS ---
           creds = Credentials.from_service_account_info(
@@ -106,5 +108,5 @@ jobs:
               server.login(notify_email, os.environ.get("EMAIL_APP_PASSWORD", ""))
               server.send_message(msg)
 
-          print("✅ Transcription completed successfully")
+          print("✅ Transcription worker completed successfully")
           EOF
