@@ -2,7 +2,7 @@ name: Transcribe Twilio Recording
 
 on:
   repository_dispatch:
-    types: [run-transcription]
+    types: [transcribe]
 
 jobs:
   transcribe:
@@ -19,94 +19,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install requests openai google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+          pip install --upgrade pip
+          pip install openai requests google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
 
-      - name: Run transcription worker
+      - name: Run transcription
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
-          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
-          GOOGLE_SHEETS_CREDENTIALS_JSON: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_JSON }}
-          GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
-          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
           RECORDING_URL: ${{ github.event.client_payload.recording_url }}
-          CALL_SID: ${{ github.event.client_payload.call_sid }}
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}
+          TWILIO_AUTH: ${{ secrets.TWILIO_AUTH }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
         run: |
-          python << 'EOF'
-          import os
-          import requests
-          from datetime import datetime
-          from openai import OpenAI
-          from google.oauth2.service_account import Credentials
-          from googleapiclient.discovery import build
-          from email.message import EmailMessage
-          import smtplib
-
-          # --- ENV ---
-          recording_url = os.environ["RECORDING_URL"]
-          call_sid = os.environ["CALL_SID"]
-          notify_email = os.environ["NOTIFY_EMAIL"]
-
-          print("Downloading recording:", recording_url)
-
-          # --- DOWNLOAD RECORDING ---
-          audio_response = requests.get(
-              recording_url + ".wav",
-              auth=(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
-          )
-          audio_response.raise_for_status()
-
-          audio_path = "recording.wav"
-          with open(audio_path, "wb") as f:
-              f.write(audio_response.content)
-
-          # --- TRANSCRIBE WITH OPENAI ---
-          client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-          with open(audio_path, "rb") as audio_file:
-              transcript = client.audio.transcriptions.create(
-                  model="gpt-4o-transcribe",
-                  file=audio_file
-              )
-
-          text = transcript.text.strip()
-          print("Transcription complete")
-
-          # --- WRITE TO GOOGLE SHEETS ---
-          creds = Credentials.from_service_account_info(
-              eval(os.environ["GOOGLE_SHEETS_CREDENTIALS_JSON"]),
-              scopes=["https://www.googleapis.com/auth/spreadsheets"]
-          )
-
-          sheets = build("sheets", "v4", credentials=creds)
-          sheet = sheets.spreadsheets()
-
-          row = [[
-              datetime.utcnow().isoformat(),
-              call_sid,
-              recording_url,
-              text
-          ]]
-
-          sheet.values().append(
-              spreadsheetId=os.environ["GOOGLE_SHEET_NAME"],
-              range="Sheet1!A:D",
-              valueInputOption="RAW",
-              body={"values": row}
-          ).execute()
-
-          # --- SEND EMAIL ---
-          msg = EmailMessage()
-          msg["Subject"] = "Daily Call Transcription"
-          msg["From"] = notify_email
-          msg["To"] = notify_email
-          msg.set_content(text)
-
-          with smtplib.SMTP("smtp.gmail.com", 587) as server:
-              server.starttls()
-              server.login(notify_email, os.environ.get("EMAIL_APP_PASSWORD", ""))
-              server.send_message(msg)
-
-          print("✅ Transcription worker completed successfully")
-          EOF
+          python scripts/transcribe.py
