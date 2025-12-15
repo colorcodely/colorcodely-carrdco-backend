@@ -36,7 +36,12 @@ GITHUB_DISPATCH_URL = f"https://api.github.com/repos/{os.environ['GITHUB_REPO']}
 GITHUB_HEADERS = {
     "Authorization": f"token {os.environ['GH_ACTIONS_TOKEN']}",
     "Accept": "application/vnd.github+json",
+    # Not strictly required, but helpful / more standard:
+    "User-Agent": "colorcodely-dispatcher",
 }
+
+# IMPORTANT: this MUST match your workflow `types: [...]`
+DISPATCH_EVENT_TYPE = "twilio-recording"
 
 
 # ======================
@@ -75,7 +80,6 @@ def twiml_record():
     - Twilio may hit this endpoint multiple times
     - We must only issue <Record> once
     """
-
     already_recorded = request.values.get("RecordingSid")
 
     response = VoiceResponse()
@@ -113,24 +117,34 @@ def recording_complete():
     logging.info(f"Recording URL: {recording_url}")
 
     payload = {
-        "event_type": "run-transcription",
+        # MUST match workflow types: [twilio-recording]
+        "event_type": DISPATCH_EVENT_TYPE,
         "client_payload": {
             "recording_url": recording_url,
             "call_sid": call_sid,
         },
     }
 
-    r = requests.post(
-        GITHUB_DISPATCH_URL,
-        headers=GITHUB_HEADERS,
-        json=payload,
-        timeout=15,
-    )
+    try:
+        r = requests.post(
+            GITHUB_DISPATCH_URL,
+            headers=GITHUB_HEADERS,
+            json=payload,
+            timeout=15,
+        )
 
-    if r.status_code >= 300:
-        logging.error(f"GitHub dispatch failed: {r.status_code} {r.text}")
-    else:
-        logging.info("GitHub Actions transcription dispatched")
+        # Always log what GitHub said (this is gold for troubleshooting)
+        logging.info(f"GitHub dispatch status: {r.status_code}")
+        if r.text:
+            logging.info(f"GitHub dispatch response: {r.text}")
+
+        if r.status_code >= 300:
+            logging.error(f"GitHub dispatch failed: {r.status_code} {r.text}")
+        else:
+            logging.info("GitHub Actions transcription dispatched")
+
+    except Exception as e:
+        logging.exception(f"GitHub dispatch exception: {e}")
 
     return "", 200
 
