@@ -2,11 +2,22 @@ name: Transcribe Twilio Recording
 
 on:
   repository_dispatch:
-    types: [twilio-recording]
+    types: [run-transcription]
 
 jobs:
   transcribe:
     runs-on: ubuntu-latest
+
+    env:
+      # Core secrets
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+
+      # Payload values
+      TWILIO_RECORDING_URL: ${{ github.event.client_payload.recording_url }}
+      CALL_SID: ${{ github.event.client_payload.call_sid }}
 
     steps:
       - name: Checkout repository
@@ -22,11 +33,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 🔑 THIS IS THE FIX
-      - name: Export Twilio payload variables
-        run: |
-          echo "TWILIO_RECORDING_URL=${{ github.event.client_payload.recording_url }}" >> $GITHUB_ENV
-          echo "TWILIO_CALL_SID=${{ github.event.client_payload.call_sid }}" >> $GITHUB_ENV
-
       - name: Run transcription worker
-        run: python transcribe_and_log.py
+        run: |
+          python transcribe_and_log.py
