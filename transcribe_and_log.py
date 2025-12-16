@@ -1,68 +1,91 @@
 import os
 import requests
-from requests.auth import HTTPBasicAuth
+import tempfile
+from datetime import datetime
+
+from openai import OpenAI
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 # =========================
-# Required Environment Vars
+# Environment Variables
 # =========================
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
 
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
+
 # =========================
-# Step 1: Download recording
+# OpenAI Client
+# =========================
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# =========================
+# Download Twilio Recording
 # =========================
 print(f"Downloading recording: {TWILIO_RECORDING_URL}")
 
-audio_response = requests.get(
+response = requests.get(
     f"{TWILIO_RECORDING_URL}.wav",
-    auth=HTTPBasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-    timeout=60
+    auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+    timeout=30,
 )
+response.raise_for_status()
 
-audio_response.raise_for_status()
-
-audio_path = "recording.wav"
-with open(audio_path, "wb") as f:
-    f.write(audio_response.content)
+with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+    f.write(response.content)
+    audio_path = f.name
 
 print("Recording downloaded")
 
 # =========================
-# Step 2: Send to OpenAI
+# Transcribe with Whisper
 # =========================
-print("Sending audio to OpenAI (whisper-1)")
+with open(audio_path, "rb") as audio_file:
+    transcription_response = client.audio.transcriptions.create(
+        file=audio_file,
+        model="whisper-1",
+    )
 
-openai_response = requests.post(
-    "https://api.openai.com/v1/audio/transcriptions",
-    headers={
-        "Authorization": f"Bearer {OPENAI_API_KEY}"
-    },
-    files={
-        "file": ("recording.wav", open(audio_path, "rb"), "audio/wav")
-    },
-    data={
-        "model": "whisper-1",
-        "response_format": "text"
-    },
-    timeout=120
+transcription_text = transcription_response.text.strip()
+print("Transcription complete")
+
+# =========================
+# Google Sheets Setup
+# =========================
+creds = service_account.Credentials.from_service_account_info(
+    eval(GOOGLE_SERVICE_ACCOUNT_JSON),
+    scopes=["https://www.googleapis.com/auth/spreadsheets"],
 )
 
-openai_response.raise_for_status()
-
-transcription_text = openai_response.text.strip()
-
-print("Transcription complete")
-print("----- TRANSCRIPTION START -----")
-print(transcription_text)
-print("----- TRANSCRIPTION END -----")
+service = build("sheets", "v4", credentials=creds)
+sheet = service.spreadsheets()
 
 # =========================
-# Step 3: Persist / forward
+# Prepare Row (matches your headers)
+# Sheet: DailyTranscriptions
+# Columns:
+# date | time | source_call_sid | colors_detected | confidence | transcription
 # =========================
-# At this point:
-# - transcription_text contains the final transcript
-# - You can log it, store it, or send it to Google Sheets here
-# - Leaving unchanged per current pipeline
+now = datetime.now()
 
+row = [
+    now.strftime("%Y-%m-%d"),     # date
+    now.strftime("%H:%M:%S"),     # time
+    "",                           # source_call_sid (can fill later)
+    "",                           # colors_detected (future logic)
+    "",                           # confidence (future logic)
+    transcription_text,           # transcription
+]
+
+sheet.values().append(
+    spreadsheetId=GOOGLE_SHEET_ID,
+    range="DailyTranscriptions!A:F",
+    valueInputOption="RAW",
+    body={"values": [row]},
+).execute()
+
+print("Google Sheet updated successfully")
