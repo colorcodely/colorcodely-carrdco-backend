@@ -2,55 +2,75 @@ import os
 import requests
 import tempfile
 from openai import OpenAI
-from sheets import save_daily_transcription
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
+# --- Required environment variables ---
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
+TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
+GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
+NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL")
+
+# --- OpenAI client (correct for SDK 1.x) ---
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+print(f"Downloading recording: {TWILIO_RECORDING_URL}")
 
-def download_recording(url: str) -> str:
-    """
-    Downloads a Twilio recording and returns local file path
-    """
-    response = requests.get(
-        f"{url}.wav",
-        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-        timeout=60,
+# --- Download recording from Twilio ---
+response = requests.get(
+    f"{TWILIO_RECORDING_URL}.wav",
+    auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+)
+response.raise_for_status()
+
+with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+    f.write(response.content)
+    audio_path = f.name
+
+# --- Transcription ---
+with open(audio_path, "rb") as audio_file:
+    transcription = client.audio.transcriptions.create(
+        file=audio_file,
+        model="gpt-4o-transcribe"
     )
-    response.raise_for_status()
 
-    fd, path = tempfile.mkstemp(suffix=".wav")
-    with os.fdopen(fd, "wb") as f:
-        f.write(response.content)
+text = transcription.text
+print("Transcription complete")
 
-    return path
+# --- Google Sheets ---
+creds = service_account.Credentials.from_service_account_info(
+    eval(GOOGLE_SERVICE_ACCOUNT_JSON),
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+)
 
+service = build("sheets", "v4", credentials=creds)
+sheet = service.spreadsheets()
 
-def transcribe_audio(file_path: str) -> str:
-    with open(file_path, "rb") as audio_file:
-        transcript = client.audio.transcriptions.create(
-            file=audio_file,
-            model="gpt-4o-transcribe"
-        )
-    return transcript.text
+sheet.values().append(
+    spreadsheetId=GOOGLE_SHEET_ID,
+    range="Sheet1!A:A",
+    valueInputOption="RAW",
+    body={"values": [[text]]}
+).execute()
 
+print("Google Sheet updated")
 
-def main():
-    print("Downloading recording...")
-    audio_path = download_recording(RECORDING_URL)
+# --- Optional email ---
+if NOTIFY_EMAIL:
+    from email.message import EmailMessage
+    import smtplib
 
-    print("Transcribing audio...")
-    transcript_text = transcribe_audio(audio_path)
+    msg = EmailMessage()
+    msg.set_content(text)
+    msg["Subject"] = "Daily Call Transcription"
+    msg["From"] = NOTIFY_EMAIL
+    msg["To"] = NOTIFY_EMAIL
 
-    print("Saving to Google Sheets...")
-    save_daily_transcription(transcript_text)
+    with smtplib.SMTP("localhost") as s:
+        s.send_message(msg)
 
-    print("Transcription complete.")
-
-
-if __name__ == "__main__":
-    main()
+    print("Notification email sent")
