@@ -3,25 +3,21 @@ import requests
 import tempfile
 from datetime import datetime
 
-from openai import OpenAI
+import openai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 # =========================
 # Environment Variables
 # =========================
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+openai.api_key = os.environ["OPENAI_API_KEY"]
+
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
 
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-
-# =========================
-# OpenAI Client
-# =========================
-client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
 # Download Twilio Recording
@@ -45,12 +41,12 @@ print("Recording downloaded")
 # Transcribe with Whisper
 # =========================
 with open(audio_path, "rb") as audio_file:
-    transcription_response = client.audio.transcriptions.create(
-        file=audio_file,
+    transcription = openai.Audio.transcribe(
         model="whisper-1",
+        file=audio_file,
     )
 
-transcription_text = transcription_response.text.strip()
+transcription_text = transcription["text"].strip()
 print("Transcription complete")
 
 # =========================
@@ -65,20 +61,18 @@ service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
 
 # =========================
-# Prepare Row (matches your headers)
-# Sheet: DailyTranscriptions
-# Columns:
+# Prepare Row (DailyTranscriptions)
 # date | time | source_call_sid | colors_detected | confidence | transcription
 # =========================
 now = datetime.now()
 
 row = [
-    now.strftime("%Y-%m-%d"),     # date
-    now.strftime("%H:%M:%S"),     # time
-    "",                           # source_call_sid (can fill later)
-    "",                           # colors_detected (future logic)
-    "",                           # confidence (future logic)
-    transcription_text,           # transcription
+    now.strftime("%Y-%m-%d"),
+    now.strftime("%H:%M:%S"),
+    "",
+    "",
+    "",
+    transcription_text,
 ]
 
 sheet.values().append(
