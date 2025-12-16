@@ -1,0 +1,15 @@
+name: dispatch-debug
+
+on:
+  repository_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm dispatch receipt
+        run: |
+          echo "Repository dispatch received"
+          echo "Event type: ${{ github.event.action }}"
+          echo "Payload:"
+          echo '${{ toJson(github.event.client_payload) }}'
