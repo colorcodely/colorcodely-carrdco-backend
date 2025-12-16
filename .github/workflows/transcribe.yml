@@ -22,9 +22,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Export recording URL
+      - name: Export Twilio payload variables
         run: |
-          echo "RECORDING_URL=${{ github.event.client_payload.recording_url }}" >> $GITHUB_ENV
+          echo "TWILIO_RECORDING_URL=${{ github.event.client_payload.recording_url }}" >> $GITHUB_ENV
           echo "CALL_SID=${{ github.event.client_payload.call_sid }}" >> $GITHUB_ENV
 
       - name: Run transcription worker
