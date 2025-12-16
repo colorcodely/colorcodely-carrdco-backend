@@ -46,11 +46,11 @@ with open(audio_path, "rb") as audio_file:
         file=audio_file,
     )
 
-transcription_text = transcription["text"].strip()
+text = transcription["text"].strip()
 print("Transcription complete")
 
 # =========================
-# Google Sheets Setup
+# Google Sheets
 # =========================
 creds = service_account.Credentials.from_service_account_info(
     eval(GOOGLE_SERVICE_ACCOUNT_JSON),
@@ -60,19 +60,15 @@ creds = service_account.Credentials.from_service_account_info(
 service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
 
-# =========================
-# Prepare Row (DailyTranscriptions)
-# date | time | source_call_sid | colors_detected | confidence | transcription
-# =========================
 now = datetime.now()
 
 row = [
-    now.strftime("%Y-%m-%d"),
-    now.strftime("%H:%M:%S"),
-    "",
-    "",
-    "",
-    transcription_text,
+    now.strftime("%Y-%m-%d"),   # date
+    now.strftime("%H:%M:%S"),   # time
+    "",                         # source_call_sid (optional)
+    "",                         # colors_detected (future)
+    "",                         # confidence (future)
+    text,                       # transcription
 ]
 
 sheet.values().append(
