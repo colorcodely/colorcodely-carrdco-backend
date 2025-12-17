@@ -2,6 +2,7 @@ name: dispatch-debug
 
 on:
   repository_dispatch:
+    types: [debug]
 
 jobs:
   debug:
