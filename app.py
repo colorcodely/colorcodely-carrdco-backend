@@ -13,7 +13,9 @@ logging.basicConfig(level=logging.INFO)
 
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM"]
+
+# ✅ FIXED: matches Render exactly
+TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
 TWILIO_TO_NUMBER = os.environ["TWILIO_TO_NUMBER"]
 
 APP_BASE_URL = os.environ.get(
@@ -52,17 +54,11 @@ def daily_call():
     return jsonify({"call_sid": call.sid})
 
 # =========================
-# TwiML — RECORD ONCE, THEN HANG UP
+# TwiML — RECORD ONCE, NO LOOP
 # =========================
 
 @app.route("/twiml/record", methods=["POST"])
 def twiml_record():
-    """
-    This endpoint MUST return a single <Record> with no loop.
-    When the recording finishes, Twilio will POST to
-    /twilio/recording-complete and then end the call.
-    """
-
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Record
@@ -89,7 +85,6 @@ def recording_complete():
     logging.info(f"Call SID: {call_sid}")
     logging.info(f"Recording URL: {recording_url}")
 
-    # Fire GitHub repository_dispatch
     if GH_ACTIONS_TOKEN and GITHUB_REPO and recording_url:
         dispatch_url = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
         headers = {
@@ -105,7 +100,10 @@ def recording_complete():
         }
 
         response = requests.post(
-            dispatch_url, headers=headers, json=payload, timeout=10
+            dispatch_url,
+            headers=headers,
+            json=payload,
+            timeout=10,
         )
 
         logging.info(f"GitHub dispatch response: {response.status_code}")
