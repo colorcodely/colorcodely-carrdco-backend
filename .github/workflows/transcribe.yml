@@ -1,13 +1,6 @@
 name: Transcribe Twilio Recording
 
 on:
-  workflow_dispatch:
-    inputs:
-      recording_url:
-        description: "Twilio recording URL"
-        required: true
-        type: string
-
   repository_dispatch:
     types: [transcribe]
 
@@ -22,6 +15,7 @@ jobs:
       TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
       TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
 
+      # 🔑 SMTP (THIS WAS MISSING)
       SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
       SMTP_PORT: ${{ secrets.SMTP_PORT }}
       SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
@@ -45,11 +39,7 @@ jobs:
 
       - name: Inject Twilio recording URL
         run: |
-          if [ -n "${{ github.event.client_payload.recording_url }}" ]; then
-            echo "TWILIO_RECORDING_URL=${{ github.event.client_payload.recording_url }}" >> $GITHUB_ENV
-          else
-            echo "TWILIO_RECORDING_URL=${{ inputs.recording_url }}" >> $GITHUB_ENV
-          fi
+          echo "TWILIO_RECORDING_URL=${{ github.event.client_payload.recording_url }}" >> $GITHUB_ENV
 
       - name: Run transcription + email
         run: |
