@@ -1,121 +1,81 @@
 import os
-import logging
 import requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, Response, jsonify
 from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
-# =========================
-# Environment Variables
-# =========================
-
+# --- Environment variables ---
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_FROM = os.environ["TWILIO_FROM"]
+TWILIO_TO = os.environ["TWILIO_TO"]
 
-# ✅ FIXED: matches Render exactly
-TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
-TWILIO_TO_NUMBER = os.environ["TWILIO_TO_NUMBER"]
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_REPO = os.environ["GITHUB_REPO"]  # e.g. colorcodely/colorcodely-carrdco-backend
 
-APP_BASE_URL = os.environ.get(
-    "APP_BASE_URL",
-    "https://colorcodely-carrdco-backend.onrender.com"
-)
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-GH_ACTIONS_TOKEN = os.environ.get("GH_ACTIONS_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")
-
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-# =========================
-# Health Check
-# =========================
-
-@app.route("/", methods=["GET", "HEAD"])
+# --- Health check ---
+@app.route("/", methods=["GET"])
 def health():
     return "OK", 200
 
-# =========================
-# Trigger Daily Call
-# =========================
-
+# --- Trigger outbound call ---
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
-    call = twilio_client.calls.create(
-        to=TWILIO_TO_NUMBER,
-        from_=TWILIO_FROM_NUMBER,
-        url=f"{APP_BASE_URL}/twiml/record",
-        timeout=55,
-        trim="trim-silence",
+    call = client.calls.create(
+        to=TWILIO_TO,
+        from_=TWILIO_FROM,
+        url="https://colorcodely-carrdco-backend.onrender.com/twiml/record",
+        method="POST",
     )
 
-    logging.info(f"Call started: {call.sid}")
+    print(f"Call started: {call.sid}")
     return jsonify({"call_sid": call.sid})
 
-# =========================
-# TwiML — RECORD ONCE, NO LOOP
-# =========================
-
+# --- TwiML: RECORD ONCE, THEN HANG UP ---
 @app.route("/twiml/record", methods=["POST"])
 def twiml_record():
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Record
-    maxLength="120"
-    playBeep="false"
-    trim="trim-silence"
-    recordingStatusCallback="{APP_BASE_URL}/twilio/recording-complete"
-    recordingStatusCallbackMethod="POST"
-  />
-</Response>
-"""
-    return Response(twiml, mimetype="text/xml")
+    response = VoiceResponse()
 
-# =========================
-# Recording Complete Callback
-# =========================
+    response.record(
+        max_length=120,
+        play_beep=False,
+        trim="trim-silence",
+        recording_status_callback="https://colorcodely-carrdco-backend.onrender.com/twilio/recording-complete",
+        recording_status_callback_method="POST",
+    )
 
+    response.hangup()
+
+    return Response(str(response), mimetype="text/xml")
+
+# --- Recording complete webhook ---
 @app.route("/twilio/recording-complete", methods=["POST"])
 def recording_complete():
     recording_url = request.form.get("RecordingUrl")
     call_sid = request.form.get("CallSid")
 
-    logging.info("Recording completed")
-    logging.info(f"Call SID: {call_sid}")
-    logging.info(f"Recording URL: {recording_url}")
+    print("Recording completed")
+    print(f"Call SID: {call_sid}")
+    print(f"Recording URL: {recording_url}")
 
-    if GH_ACTIONS_TOKEN and GITHUB_REPO and recording_url:
-        dispatch_url = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
-        headers = {
-            "Authorization": f"token {GH_ACTIONS_TOKEN}",
-            "Accept": "application/vnd.github+json",
-        }
-        payload = {
-            "event_type": "twilio-recording",
-            "client_payload": {
-                "recording_url": recording_url,
-                "call_sid": call_sid,
-            },
-        }
+    # Dispatch GitHub workflow
+    dispatch_url = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+    payload = {
+        "event_type": "twilio-recording",
+        "client_payload": {
+            "recording_url": recording_url
+        },
+    }
 
-        response = requests.post(
-            dispatch_url,
-            headers=headers,
-            json=payload,
-            timeout=10,
-        )
-
-        logging.info(f"GitHub dispatch response: {response.status_code}")
-    else:
-        logging.warning("GitHub dispatch not configured — skipping dispatch")
+    r = requests.post(dispatch_url, json=payload, headers=headers)
+    print("GitHub dispatch response:", r.status_code)
 
     return "", 200
-
-# =========================
-# Entrypoint
-# =========================
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
