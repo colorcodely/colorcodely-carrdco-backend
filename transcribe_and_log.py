@@ -1,37 +1,46 @@
 import os
 import requests
 import tempfile
-import smtplib
-from email.message import EmailMessage
 from datetime import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 import openai
-import gspread
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 # =========================
 # Environment Variables
 # =========================
+
+# OpenAI
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
+# Twilio
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
 
+# Google Sheets
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
+# Email / SMTP (MATCHES GITHUB SECRETS EXACTLY)
 SMTP_SERVER = os.environ["SMTP_SERVER"]
 SMTP_PORT = int(os.environ["SMTP_PORT"])
 SMTP_USERNAME = os.environ["SMTP_USERNAME"]
 SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
 SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
-SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "Color Code Alert")
+SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
+
+# Temporary single-recipient (until subscriber logic is expanded)
+NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
 # =========================
 # Download Twilio Recording
 # =========================
+
 print(f"Downloading recording: {TWILIO_RECORDING_URL}")
 
 response = requests.get(
@@ -50,6 +59,7 @@ print("Recording downloaded")
 # =========================
 # Transcribe with Whisper
 # =========================
+
 with open(audio_path, "rb") as audio_file:
     transcription = openai.Audio.transcribe(
         model="whisper-1",
@@ -60,36 +70,29 @@ text = transcription["text"].strip()
 print("Transcription complete")
 
 # =========================
-# Google Sheets Setup
+# Google Sheets Append
 # =========================
+
 creds = service_account.Credentials.from_service_account_info(
     eval(GOOGLE_SERVICE_ACCOUNT_JSON),
     scopes=["https://www.googleapis.com/auth/spreadsheets"],
 )
 
-# Sheets API (for DailyTranscriptions)
 service = build("sheets", "v4", credentials=creds)
-sheet_api = service.spreadsheets()
+sheet = service.spreadsheets()
 
-# gspread (for Subscribers tab)
-gc = gspread.authorize(creds)
-spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
-
-# =========================
-# Append DailyTranscriptions
-# =========================
 now = datetime.now()
 
 row = [
-    now.strftime("%Y-%m-%d"),   # date
-    now.strftime("%H:%M:%S"),   # time
-    "",                         # source_call_sid
-    "",                         # colors_detected
-    "",                         # confidence
+    now.strftime("%Y-%m-%d"),   # Date
+    now.strftime("%H:%M:%S"),   # Time
+    "",                         # source_call_sid (future)
+    "",                         # colors_detected (future)
+    "",                         # confidence (future)
     text,                       # transcription
 ]
 
-sheet_api.values().append(
+sheet.values().append(
     spreadsheetId=GOOGLE_SHEET_ID,
     range="DailyTranscriptions!A:F",
     valueInputOption="RAW",
@@ -99,45 +102,34 @@ sheet_api.values().append(
 print("Google Sheet updated successfully")
 
 # =========================
-# Read Subscribers
+# Send Email Notification
 # =========================
-subscribers_ws = spreadsheet.worksheet("Subscribers")
-subscribers = subscribers_ws.get_all_records()
 
-emails = [
-    row["email"].strip()
-    for row in subscribers
-    if row.get("email")
-]
+subject = "New Daily Transcription"
+body = f"""
+A new transcription has been recorded.
 
-print(f"Found {len(emails)} subscriber emails")
+Date: {now.strftime("%Y-%m-%d")}
+Time: {now.strftime("%H:%M:%S")}
 
-if not emails:
-    print("No subscribers found — skipping email send")
-    exit(0)
-
-# =========================
-# Send Email
-# =========================
-msg = EmailMessage()
-msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-msg["To"] = ", ".join(emails)
-msg["Subject"] = "Daily Color Code Transcription"
-
-msg.set_content(
-    f"""
-Here is the latest transcription:
-
+Transcription:
 {text}
-
-—
-This message was sent automatically.
 """
-)
 
-with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-    server.starttls()
-    server.login(SMTP_USERNAME, SMTP_PASSWORD)
-    server.send_message(msg)
+message = MIMEMultipart()
+message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+message["To"] = NOTIFY_EMAIL
+message["Subject"] = subject
 
-print("Email sent successfully to subscribers")
+message.attach(MIMEText(body, "plain"))
+
+try:
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(message)
+
+    print("Email notification sent successfully")
+
+except Exception as e:
+    print(f"Email sending failed: {e}")
