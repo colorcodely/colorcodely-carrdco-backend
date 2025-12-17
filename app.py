@@ -3,27 +3,35 @@ import logging
 import requests
 from flask import Flask, request, Response, jsonify
 from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse, Record
+from twilio.twiml.voice_response import VoiceResponse
 
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 
 # =========================
-# Environment Variables
+# Environment Variables (DEFENSIVE)
 # =========================
 
-TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 
-# IMPORTANT: use the variable that actually exists in Render
-TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
-TWILIO_TO_NUMBER = os.environ["TWILIO_TO_NUMBER"]
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
+TWILIO_TO_NUMBER = os.environ.get("TWILIO_TO_NUMBER")
 
-GITHUB_DISPATCH_URL = os.environ["GITHUB_DISPATCH_URL"]
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_DISPATCH_URL = os.environ.get("GITHUB_DISPATCH_URL")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+# =========================
+# Validate minimum requirements
+# =========================
+
+if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+    logging.error("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN")
+
+client = None
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # =========================
 # Health Check
@@ -39,6 +47,12 @@ def health():
 
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
+    if not client:
+        return jsonify({"error": "Twilio client not configured"}), 500
+
+    if not TWILIO_FROM_NUMBER or not TWILIO_TO_NUMBER:
+        return jsonify({"error": "Missing FROM or TO number"}), 500
+
     call = client.calls.create(
         to=TWILIO_TO_NUMBER,
         from_=TWILIO_FROM_NUMBER,
@@ -57,7 +71,6 @@ def daily_call():
 @app.route("/twiml/record", methods=["POST"])
 def twiml_record():
     response = VoiceResponse()
-
     response.record(
         maxLength=120,
         playBeep=False,
@@ -65,7 +78,6 @@ def twiml_record():
         recordingStatusCallback=f"{request.url_root}twilio/recording-complete",
         recordingStatusCallbackMethod="POST",
     )
-
     return Response(str(response), mimetype="text/xml")
 
 # =========================
@@ -80,6 +92,10 @@ def recording_complete():
     logging.info("Recording completed")
     logging.info(f"Call SID: {call_sid}")
     logging.info(f"Recording URL: {recording_url}")
+
+    if not GITHUB_DISPATCH_URL or not GITHUB_TOKEN:
+        logging.warning("GitHub dispatch not configured — skipping dispatch")
+        return "", 200
 
     payload = {
         "event_type": "transcribe",
