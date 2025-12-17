@@ -9,20 +9,27 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # OpenAI
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      # Google Sheets
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
 
+      # Twilio
       TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
       TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
 
-      # Email (used later — safe to keep now)
+      # Email / SMTP
       SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
       SMTP_PORT: ${{ secrets.SMTP_PORT }}
       SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
       SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
       SMTP_FROM_EMAIL: ${{ secrets.SMTP_FROM_EMAIL }}
       SMTP_FROM_NAME: ${{ secrets.SMTP_FROM_NAME }}
+
+      # Single-recipient notification (required by transcribe_and_log.py)
+      NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
 
     steps:
       - name: Checkout repository
