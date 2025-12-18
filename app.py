@@ -20,9 +20,15 @@ TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
 TWILIO_TO_NUMBER = os.environ["TWILIO_TO_NUMBER"]
 
-# GitHub dispatch
-GITHUB_DISPATCH_URL = os.environ["GITHUB_DISPATCH_URL"]
+# GitHub token (already exists in Render)
 GH_ACTIONS_TOKEN = os.environ["GH_ACTIONS_TOKEN"]
+
+# GitHub repo (hard-coded, no env var needed)
+GITHUB_OWNER = "colorcodely"
+GITHUB_REPO = "colorcodely-carrdco-backend"
+GITHUB_DISPATCH_URL = (
+    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/dispatches"
+)
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
@@ -52,12 +58,13 @@ def daily_call():
     return {"call_sid": call.sid}, 200
 
 # =========================
-# TwiML: Record Once
+# TwiML: Record ONCE, then hang up
 # =========================
 
 @app.route("/twiml/record", methods=["POST"])
 def twiml_record():
     response = VoiceResponse()
+
     response.record(
         maxLength=120,
         playBeep=False,
@@ -65,7 +72,9 @@ def twiml_record():
         recordingStatusCallback=f"{request.url_root}twilio/recording-complete",
         recordingStatusCallbackMethod="POST"
     )
+
     response.hangup()
+
     return Response(str(response), mimetype="text/xml")
 
 # =========================
@@ -98,6 +107,10 @@ def recording_complete():
     logging.info(f"GitHub dispatch response: {r.status_code}")
 
     return "", 200
+
+# =========================
+# App Entrypoint
+# =========================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
