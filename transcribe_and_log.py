@@ -1,209 +1,149 @@
 import os
 import re
-import tempfile
+import json
 import requests
 import datetime
-import logging
-import openai
+from twilio.rest import Client
 import gspread
 from google.oauth2.service_account import Credentials
 
-from notification_templates import (
-    color_day_notification,
-    no_color_day_notification
-)
-
 # =========================
-# Logging
+# ENVIRONMENT VARIABLES
 # =========================
 
-logging.basicConfig(level=logging.INFO)
-
-# =========================
-# Environment Variables
-# =========================
-
-openai.api_key = os.environ["OPENAI_API_KEY"]
-
-GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-
-# ✅ USE EXISTING VARIABLE NAME (ALREADY IN YOUR WORKFLOW)
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-
-SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
-SMTP_API_URL = os.environ["SMTP_API_URL"]
-SMTP_API_KEY = os.environ["SMTP_API_KEY"]
-
+TWILIO_SID = os.environ["TWILIO_SID"]
+TWILIO_AUTH = os.environ["TWILIO_AUTH"]
 TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
 
-TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
+EMAIL_WEBHOOK_URL = os.environ["EMAIL_WEBHOOK_URL"]  # existing, already-working method
+
+GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
+GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 
 # =========================
-# Constants
+# SETUP CLIENTS
 # =========================
 
-TESTING_CENTER_NAME = "City of Huntsville, AL Municipal Court Probation Office"
-ANNOUNCEMENT_PHONE = "256-427-7808"
+twilio_client = Client(TWILIO_SID, TWILIO_AUTH)
 
-COLOR_KEYWORDS = [
-    "you must report to drug screen",
-    "if your color is called"
-]
-
-# =========================
-# Google Sheets Setup
-# =========================
-
-creds_dict = eval(GOOGLE_SERVICE_ACCOUNT_JSON)
-
-scopes = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
-
-credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-gc = gspread.authorize(credentials)
+creds_dict = json.loads(GOOGLE_CREDS_JSON)
+scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+gc = gspread.authorize(creds)
 
 sheet = gc.open_by_key(GOOGLE_SHEET_ID)
-log_sheet = sheet.worksheet("Log")
-subscribers_sheet = sheet.worksheet("Subscribers")
+log_sheet = sheet.worksheet("Logs")
+subs_sheet = sheet.worksheet("Subscribers")
 
 # =========================
-# Helpers
+# HELPERS
 # =========================
 
-def normalize_text(text):
-    return re.sub(r"\s+", " ", text.lower()).strip()
+STOP_PHRASE = "you must report to drug screen"
 
+CODE_VARIANTS = [
+    "color code",
+    "color-code",
+    "color gold",
+    "color-gold",
+    "color goal",
+    "color-goal"
+]
 
-def detect_color_day(transcription):
-    normalized = normalize_text(transcription)
-    return any(keyword in normalized for keyword in COLOR_KEYWORDS)
+def normalize_text(text: str) -> str:
+    t = text.lower()
+    for variant in CODE_VARIANTS:
+        t = t.replace(variant, "color code")
+    return t
 
+def trim_looping(text: str) -> str:
+    idx = text.find(STOP_PHRASE)
+    if idx != -1:
+        return text[: idx + len(STOP_PHRASE)].strip()
+    return text.strip()
 
-def extract_colors(transcription):
-    match = re.search(
-        r"are (.+?)\. if your color is called",
-        transcription.lower()
-    )
-    if match:
-        return match.group(1).strip()
-    return transcription.strip()
+def detect_color_day(text: str) -> bool:
+    return "are" in text and "," in text
 
-
-def get_active_subscribers():
-    rows = subscribers_sheet.get_all_records()
-    return [
-        row["email"]
-        for row in rows
-        if row.get("active", "").strip().upper() == "YES"
-    ]
-
+def get_active_emails():
+    rows = subs_sheet.get_all_records()
+    emails = []
+    for r in rows:
+        if str(r.get("ACTIVE", "")).strip().upper() == "YES":
+            if r.get("EMAIL"):
+                emails.append(r["EMAIL"])
+    return emails
 
 def send_email(subject, body, recipients):
     payload = {
-        "from": SMTP_FROM_EMAIL,
-        "to": recipients,
         "subject": subject,
-        "text": body
+        "body": body,
+        "recipients": recipients
     }
-
-    headers = {
-        "Authorization": f"Bearer {SMTP_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    r = requests.post(SMTP_API_URL, json=payload, headers=headers)
-    logging.info(f"Email send response: {r.status_code}")
-
+    requests.post(EMAIL_WEBHOOK_URL, json=payload, timeout=10)
 
 # =========================
-# Main
+# MAIN LOGIC
 # =========================
 
-def main():
-    logging.info("Downloading recording")
+print("Downloading recording...")
+audio = requests.get(TWILIO_RECORDING_URL, auth=(TWILIO_SID, TWILIO_AUTH))
+audio.raise_for_status()
 
-    audio_response = requests.get(
-        f"{TWILIO_RECORDING_URL}.wav",
-        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+print("Sending audio for transcription...")
+transcription = twilio_client.transcriptions.create(
+    recording_url=TWILIO_RECORDING_URL
+)
+
+raw_text = transcription.transcription_text or ""
+normalized = normalize_text(raw_text)
+clean_text = trim_looping(normalized)
+
+now = datetime.datetime.now()
+date_str = now.strftime("%Y-%m-%d")
+time_str = now.strftime("%H:%M:%S")
+
+# =========================
+# LOG TO SHEET
+# =========================
+
+log_sheet.append_row([
+    date_str,
+    time_str,
+    clean_text
+])
+
+# =========================
+# EMAIL NOTIFICATION
+# =========================
+
+recipients = get_active_emails()
+
+if not recipients:
+    print("No active subscribers. Exiting.")
+    exit(0)
+
+is_color_day = detect_color_day(clean_text)
+
+if is_color_day:
+    subject = "ColorCodely Notification – City of Huntsville, AL"
+    body = (
+        "🎨 **COLOR CODE NOTIFICATION – Powered by ColorCodely!**\n\n"
+        f"📅 **DATE:** {now.strftime('%A %m/%d/%Y')}\n"
+        "🏛️ **TESTING CENTER:** City of Huntsville, AL Municipal Court Probation Office\n"
+        "📞 **ANNOUNCEMENT PHONE:** (256) 427-7808\n\n"
+        f"🎯 **COLOR CODES:**\n{clean_text}"
     )
-    audio_response.raise_for_status()
+else:
+    subject = "ColorCodely Notice – No Colors Called Today"
+    body = (
+        "🚫 **NO COLOR DAY – Powered by ColorCodely!**\n\n"
+        f"📅 **DATE:** {now.strftime('%A %m/%d/%Y')}\n"
+        "🏛️ **TESTING CENTER:** City of Huntsville, AL Municipal Court Probation Office\n\n"
+        "The testing center appears to be closed or no colors were announced today.\n"
+        "No action is required."
+    )
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-        f.write(audio_response.content)
-        audio_path = f.name
+send_email(subject, body, recipients)
 
-    logging.info("Transcribing audio")
-
-    with open(audio_path, "rb") as audio_file:
-        transcription = openai.Audio.transcribe(
-            model="whisper-1",
-            file=audio_file
-        )["text"].strip()
-
-    # -------------------------
-    # Loop cutoff
-    # -------------------------
-
-    cutoff_phrase = "if your color is called"
-    idx = transcription.lower().find(cutoff_phrase)
-    if idx != -1:
-        transcription = transcription[: idx + len(cutoff_phrase) + 1]
-
-    transcription = transcription.strip()
-
-    # -------------------------
-    # Detect type
-    # -------------------------
-
-    is_color_day = detect_color_day(transcription)
-
-    now = datetime.datetime.now()
-    date_str = now.strftime("%A %m/%d/%Y")
-    time_str = now.strftime("%H:%M:%S")
-
-    # -------------------------
-    # Log to Sheet
-    # -------------------------
-
-    log_sheet.append_row([
-        now.date().isoformat(),
-        time_str,
-        transcription
-    ])
-
-    # -------------------------
-    # Build Notification
-    # -------------------------
-
-    if is_color_day:
-        color_codes = extract_colors(transcription)
-        subject, body = color_day_notification(
-            date_str=date_str,
-            testing_center=TESTING_CENTER_NAME,
-            announcement_phone=ANNOUNCEMENT_PHONE,
-            color_codes=color_codes
-        )
-    else:
-        subject, body = no_color_day_notification(
-            date_str=date_str,
-            testing_center=TESTING_CENTER_NAME,
-            announcement_phone=ANNOUNCEMENT_PHONE
-        )
-
-    # -------------------------
-    # Send Emails
-    # -------------------------
-
-    recipients = get_active_subscribers()
-    if recipients:
-        send_email(subject, body, recipients)
-        logging.info(f"Sent email to {len(recipients)} subscribers")
-    else:
-        logging.warning("No active subscribers found")
-
-
-if __name__ == "__main__":
-    main()
+print("Transcription logged and notifications sent.")
