@@ -12,23 +12,14 @@ logging.basicConfig(level=logging.INFO)
 # Environment Variables
 # =========================
 
-# Twilio credentials
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 
-# Phone numbers (MATCHES RENDER EXACTLY)
 TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
 TWILIO_TO_NUMBER = os.environ["TWILIO_TO_NUMBER"]
 
-# GitHub token (already exists in Render)
+GITHUB_DISPATCH_URL = os.environ["GITHUB_DISPATCH_URL"]
 GH_ACTIONS_TOKEN = os.environ["GH_ACTIONS_TOKEN"]
-
-# GitHub repo (hard-coded, no env var needed)
-GITHUB_OWNER = "colorcodely"
-GITHUB_REPO = "colorcodely-carrdco-backend"
-GITHUB_DISPATCH_URL = (
-    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/dispatches"
-)
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
@@ -51,14 +42,14 @@ def daily_call():
         from_=TWILIO_FROM_NUMBER,
         url=f"{request.url_root}twiml/record",
         method="POST",
-        timeout=55
+        timeout=45
     )
 
     logging.info(f"Call started: {call.sid}")
     return {"call_sid": call.sid}, 200
 
 # =========================
-# TwiML: Record ONCE, then hang up
+# TwiML: Record ONCE (40s max)
 # =========================
 
 @app.route("/twiml/record", methods=["POST"])
@@ -66,15 +57,24 @@ def twiml_record():
     response = VoiceResponse()
 
     response.record(
-        maxLength=120,
+        maxLength=40,
         playBeep=False,
         trim="trim-silence",
         recordingStatusCallback=f"{request.url_root}twilio/recording-complete",
-        recordingStatusCallbackMethod="POST"
+        recordingStatusCallbackMethod="POST",
+        action=f"{request.url_root}twiml/end"
     )
 
-    response.hangup()
+    return Response(str(response), mimetype="text/xml")
 
+# =========================
+# TwiML End Call
+# =========================
+
+@app.route("/twiml/end", methods=["POST"])
+def twiml_end():
+    response = VoiceResponse()
+    response.hangup()
     return Response(str(response), mimetype="text/xml")
 
 # =========================
@@ -107,10 +107,6 @@ def recording_complete():
     logging.info(f"GitHub dispatch response: {r.status_code}")
 
     return "", 200
-
-# =========================
-# App Entrypoint
-# =========================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
