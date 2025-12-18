@@ -26,13 +26,18 @@ logging.basicConfig(level=logging.INFO)
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
+
+# ✅ USE EXISTING VARIABLE NAME (ALREADY IN YOUR WORKFLOW)
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
 SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
 SMTP_API_URL = os.environ["SMTP_API_URL"]
 SMTP_API_KEY = os.environ["SMTP_API_KEY"]
 
 TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
+
+TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 
 # =========================
 # Constants
@@ -50,7 +55,7 @@ COLOR_KEYWORDS = [
 # Google Sheets Setup
 # =========================
 
-creds_dict = eval(GOOGLE_CREDS_JSON)
+creds_dict = eval(GOOGLE_SERVICE_ACCOUNT_JSON)
 
 scopes = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -120,11 +125,10 @@ def send_email(subject, body, recipients):
 def main():
     logging.info("Downloading recording")
 
-    audio_response = requests.get(f"{TWILIO_RECORDING_URL}.wav", auth=(
-        os.environ["TWILIO_ACCOUNT_SID"],
-        os.environ["TWILIO_AUTH_TOKEN"]
-    ))
-
+    audio_response = requests.get(
+        f"{TWILIO_RECORDING_URL}.wav",
+        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    )
     audio_response.raise_for_status()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
