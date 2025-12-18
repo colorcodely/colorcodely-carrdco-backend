@@ -12,14 +12,18 @@ logging.basicConfig(level=logging.INFO)
 # Environment Variables
 # =========================
 
+# Twilio
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-
 TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
 TWILIO_TO_NUMBER = os.environ["TWILIO_TO_NUMBER"]
 
-GITHUB_DISPATCH_URL = os.environ["GITHUB_DISPATCH_URL"]
+# GitHub
 GH_ACTIONS_TOKEN = os.environ["GH_ACTIONS_TOKEN"]
+GITHUB_REPO = os.environ["GITHUB_REPO"]  # e.g. "colorcodely/colorcodely-carrdco-backend"
+
+# Derived GitHub dispatch URL (NO ENV VAR NEEDED)
+GITHUB_DISPATCH_URL = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
@@ -68,7 +72,7 @@ def twiml_record():
     return Response(str(response), mimetype="text/xml")
 
 # =========================
-# TwiML End Call
+# TwiML End
 # =========================
 
 @app.route("/twiml/end", methods=["POST"])
