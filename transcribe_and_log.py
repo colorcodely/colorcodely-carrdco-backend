@@ -2,6 +2,7 @@ import os
 import requests
 import tempfile
 from datetime import datetime
+import re
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -14,20 +15,16 @@ from googleapiclient.discovery import build
 # Environment Variables
 # =========================
 
-# OpenAI
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
-# Twilio
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
 CALL_SID = os.environ.get("CALL_SID", "")
 
-# Google Sheets
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
-# Email
 SMTP_SERVER = os.environ["SMTP_SERVER"]
 SMTP_PORT = int(os.environ["SMTP_PORT"])
 SMTP_USERNAME = os.environ["SMTP_USERNAME"]
@@ -37,7 +34,7 @@ SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
 # =========================
-# Download Twilio Recording
+# Download Recording
 # =========================
 
 response = requests.get(
@@ -61,7 +58,24 @@ with open(audio_path, "rb") as audio_file:
         file=audio_file,
     )
 
-text = transcription["text"].strip().lower()
+raw_text = transcription["text"].strip().lower()
+
+# =========================
+# HARD STOP CLEANUP
+# =========================
+
+STOP_PHRASE = "you must report to drug screen"
+
+match = re.search(
+    rf"(.*?{STOP_PHRASE}\.)",
+    raw_text,
+    re.IGNORECASE | re.DOTALL,
+)
+
+if match:
+    cleaned_text = match.group(1).strip()
+else:
+    cleaned_text = raw_text  # fallback, should rarely happen
 
 # =========================
 # Google Sheets Append
@@ -73,20 +87,19 @@ creds = service_account.Credentials.from_service_account_info(
 )
 
 service = build("sheets", "v4", credentials=creds)
-sheet = service.spreadsheets()
 
 now = datetime.now()
 
 row = [
-    now.strftime("%Y-%m-%d"),     # A: date
-    now.strftime("%H:%M:%S"),     # B: time
-    CALL_SID,                     # C: source_call_sid
-    "",                           # D: colors_detected (future logic)
-    "",                           # E: confidence (future logic)
-    text                          # F: transcription
+    now.strftime("%Y-%m-%d"),   # date
+    now.strftime("%H:%M:%S"),   # time
+    CALL_SID,                   # source_call_sid
+    "",                          # colors_detected (future)
+    "",                          # confidence (future)
+    cleaned_text                 # transcription
 ]
 
-sheet.values().append(
+service.spreadsheets().values().append(
     spreadsheetId=GOOGLE_SHEET_ID,
     range="DailyTranscriptions!A:F",
     valueInputOption="RAW",
@@ -98,15 +111,14 @@ sheet.values().append(
 # =========================
 
 subject = "New Color Code Transcription"
-body = f"""
-A new transcription has been recorded.
 
-Date: {row[0]}
-Time: {row[1]}
-
-Transcription:
-{text}
-"""
+body = (
+    "A new transcription has been recorded.\n\n"
+    f"Date: {row[0]}\n"
+    f"Time: {row[1]}\n\n"
+    "Transcription:\n"
+    f"{cleaned_text}"
+)
 
 message = MIMEMultipart()
 message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
