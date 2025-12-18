@@ -2,9 +2,7 @@ import os
 import requests
 import tempfile
 from datetime import datetime
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import re
 
 import openai
 from google.oauth2 import service_account
@@ -14,34 +12,18 @@ from googleapiclient.discovery import build
 # Environment Variables
 # =========================
 
-# OpenAI
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
-# Twilio
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
 
-# Google Sheets
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
-# Email / SMTP (MATCHES GITHUB SECRETS EXACTLY)
-SMTP_SERVER = os.environ["SMTP_SERVER"]
-SMTP_PORT = int(os.environ["SMTP_PORT"])
-SMTP_USERNAME = os.environ["SMTP_USERNAME"]
-SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
-SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
-SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
-
-# Temporary single-recipient (until subscriber logic is expanded)
-NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
-
 # =========================
-# Download Twilio Recording
+# Download Recording
 # =========================
-
-print(f"Downloading recording: {TWILIO_RECORDING_URL}")
 
 response = requests.get(
     f"{TWILIO_RECORDING_URL}.wav",
@@ -54,10 +36,8 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
     f.write(response.content)
     audio_path = f.name
 
-print("Recording downloaded")
-
 # =========================
-# Transcribe with Whisper
+# Transcribe
 # =========================
 
 with open(audio_path, "rb") as audio_file:
@@ -66,8 +46,23 @@ with open(audio_path, "rb") as audio_file:
         file=audio_file,
     )
 
-text = transcription["text"].strip()
-print("Transcription complete")
+raw_text = transcription["text"].strip()
+
+# =========================
+# Normalize & Clean
+# =========================
+
+text = raw_text.lower()
+
+text = re.sub(r"\bgoal\b", "code", text)
+text = re.sub(r"\bgold\b", "code", text)
+
+sentences = []
+for sentence in re.split(r"(?<=[.!?])\s+", text):
+    if sentence not in sentences:
+        sentences.append(sentence)
+
+clean_text = " ".join(sentences).strip()
 
 # =========================
 # Google Sheets Append
@@ -84,52 +79,14 @@ sheet = service.spreadsheets()
 now = datetime.now()
 
 row = [
-    now.strftime("%Y-%m-%d"),   # Date
-    now.strftime("%H:%M:%S"),   # Time
-    "",                         # source_call_sid (future)
-    "",                         # colors_detected (future)
-    "",                         # confidence (future)
-    text,                       # transcription
+    now.strftime("%Y-%m-%d"),
+    now.strftime("%H:%M:%S"),
+    clean_text,
 ]
 
 sheet.values().append(
     spreadsheetId=GOOGLE_SHEET_ID,
-    range="DailyTranscriptions!A:F",
+    range="DailyTranscriptions!A:C",
     valueInputOption="RAW",
     body={"values": [row]},
 ).execute()
-
-print("Google Sheet updated successfully")
-
-# =========================
-# Send Email Notification
-# =========================
-
-subject = "New Daily Transcription"
-body = f"""
-A new transcription has been recorded.
-
-Date: {now.strftime("%Y-%m-%d")}
-Time: {now.strftime("%H:%M:%S")}
-
-Transcription:
-{text}
-"""
-
-message = MIMEMultipart()
-message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-message["To"] = NOTIFY_EMAIL
-message["Subject"] = subject
-
-message.attach(MIMEText(body, "plain"))
-
-try:
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(message)
-
-    print("Email notification sent successfully")
-
-except Exception as e:
-    print(f"Email sending failed: {e}")
