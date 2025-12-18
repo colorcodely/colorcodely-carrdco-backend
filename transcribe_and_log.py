@@ -1,197 +1,213 @@
 import os
+import re
 import requests
-import tempfile
-from datetime import datetime
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import datetime
+import logging
+import gspread
+from google.oauth2.service_account import Credentials
+from openai import OpenAI
 
-import openai
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from notification_templates import (
+    color_day_notification,
+    no_color_day_notification
+)
+
+# =========================
+# Logging
+# =========================
+
+logging.basicConfig(level=logging.INFO)
 
 # =========================
 # Environment Variables
 # =========================
 
-# OpenAI
-openai.api_key = os.environ["OPENAI_API_KEY"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-# Twilio
-TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
-
-# Google Sheets
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
+GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 
-# Email / SMTP
-SMTP_SERVER = os.environ["SMTP_SERVER"]
-SMTP_PORT = int(os.environ["SMTP_PORT"])
-SMTP_USERNAME = os.environ["SMTP_USERNAME"]
-SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
 SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
-SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
+SMTP_API_URL = os.environ["SMTP_API_URL"]
+SMTP_API_KEY = os.environ["SMTP_API_KEY"]
 
 # =========================
-# Helper: normalize transcription
+# Constants
 # =========================
 
-def clean_transcription(text: str) -> str:
-    """
-    - Stops at first occurrence of 'you must report to drug screen.'
-    - Fixes common Whisper errors (gold/goal -> code)
-    """
-    text = text.lower().strip()
+TESTING_CENTER_NAME = "City of Huntsville, AL Municipal Court Probation Office"
+ANNOUNCEMENT_PHONE = "256-427-7808"
 
-    replacements = {
-        "color gold": "color code",
-        "color-goal": "color code",
-        "color goal": "color code",
-        "color-gold": "color code",
-    }
-
-    for bad, good in replacements.items():
-        text = text.replace(bad, good)
-
-    stop_phrase = "you must report to drug screen."
-    if stop_phrase in text:
-        text = text.split(stop_phrase)[0] + stop_phrase
-
-    return text.strip()
-
-# =========================
-# Download Twilio Recording
-# =========================
-
-print(f"Downloading recording: {TWILIO_RECORDING_URL}")
-
-response = requests.get(
-    f"{TWILIO_RECORDING_URL}.wav",
-    auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-    timeout=30,
-)
-response.raise_for_status()
-
-with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-    f.write(response.content)
-    audio_path = f.name
-
-print("Recording downloaded")
-
-# =========================
-# Transcribe with Whisper
-# =========================
-
-with open(audio_path, "rb") as audio_file:
-    transcription = openai.Audio.transcribe(
-        model="whisper-1",
-        file=audio_file,
-    )
-
-raw_text = transcription["text"]
-text = clean_transcription(raw_text)
-
-print("Transcription complete")
+COLOR_KEYWORDS = [
+    "you must report to drug screen",
+    "if your color is called"
+]
 
 # =========================
 # Google Sheets Setup
 # =========================
 
-creds = service_account.Credentials.from_service_account_info(
-    eval(GOOGLE_SERVICE_ACCOUNT_JSON),
-    scopes=["https://www.googleapis.com/auth/spreadsheets"],
-)
+creds_dict = eval(GOOGLE_CREDS_JSON)
 
-service = build("sheets", "v4", credentials=creds)
-sheet = service.spreadsheets()
-
-now = datetime.now()
-
-# =========================
-# Append to DailyTranscriptions
-# =========================
-
-row = [
-    now.strftime("%Y-%m-%d"),   # date
-    now.strftime("%H:%M:%S"),   # time
-    "",                         # source_call_sid (future)
-    "",                         # colors_detected (future)
-    "",                         # confidence (future)
-    text,                       # transcription
+scopes = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
 ]
 
-sheet.values().append(
-    spreadsheetId=GOOGLE_SHEET_ID,
-    range="DailyTranscriptions!A:F",
-    valueInputOption="RAW",
-    body={"values": [row]},
-).execute()
+credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+gc = gspread.authorize(credentials)
 
-print("DailyTranscriptions updated")
+sheet = gc.open_by_key(GOOGLE_SHEET_ID)
 
-# =========================
-# Fetch Active Subscribers
-# =========================
-
-subscriber_result = sheet.values().get(
-    spreadsheetId=GOOGLE_SHEET_ID,
-    range="Subscribers!A2:G",
-).execute()
-
-rows = subscriber_result.get("values", [])
-
-active_emails = []
-
-for row in rows:
-    if len(row) < 5:
-        continue
-
-    email = row[1].strip()
-    active_flag = row[4].strip().upper()
-
-    if email and active_flag == "YES":
-        active_emails.append(email)
-
-print(f"Active subscribers: {active_emails}")
+log_sheet = sheet.worksheet("Log")
+subscribers_sheet = sheet.worksheet("Subscribers")
 
 # =========================
-# Send Email to Active Subscribers
+# OpenAI Client
 # =========================
 
-if active_emails:
-    subject = "Daily Color Code Announcement"
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-    body = f"""Hello,
+# =========================
+# Helpers
+# =========================
 
-Here is today's recorded color code announcement:
+def normalize_text(text):
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-Date: {now.strftime("%Y-%m-%d")}
-Time: {now.strftime("%H:%M:%S")}
 
-{ text }
+def detect_color_day(transcription):
+    normalized = normalize_text(transcription)
+    return any(keyword in normalized for keyword in COLOR_KEYWORDS)
 
-This message was automatically generated.
-"""
 
-    message = MIMEMultipart()
-    message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    message["To"] = ", ".join(active_emails)
-    message["Subject"] = subject
+def extract_colors(transcription):
+    """
+    Attempts to extract just the color list portion.
+    Falls back to cleaned transcription if uncertain.
+    """
 
-    message.attach(MIMEText(body, "plain"))
+    match = re.search(
+        r"are (.+?)\. if your color is called",
+        transcription.lower()
+    )
 
-    try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.send_message(message)
+    if match:
+        return match.group(1).strip()
 
-        print("Email sent to active subscribers")
+    return transcription.strip()
 
-    except Exception as e:
-        print(f"Email sending failed: {e}")
 
-else:
-    print("No active subscribers found — no email sent")
+def get_active_subscribers():
+    records = subscribers_sheet.get_all_records()
+    return [
+        row["email"]
+        for row in records
+        if row.get("active", "").strip().upper() == "YES"
+    ]
+
+
+def send_email(subject, body, recipients):
+    payload = {
+        "from": SMTP_FROM_EMAIL,
+        "to": recipients,
+        "subject": subject,
+        "text": body
+    }
+
+    headers = {
+        "Authorization": f"Bearer {SMTP_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.post(SMTP_API_URL, json=payload, headers=headers)
+
+    logging.info(f"Email send status: {response.status_code}")
+
+
+# =========================
+# Main Entry Point
+# =========================
+
+def main(recording_url, call_sid):
+    logging.info("Starting transcription workflow")
+
+    # -------------------------
+    # Transcribe audio
+    # -------------------------
+
+    transcription_response = openai_client.audio.transcriptions.create(
+        file=recording_url,
+        model="gpt-4o-transcribe"
+    )
+
+    transcription = transcription_response.text.strip()
+    logging.info("Raw transcription received")
+
+    # -------------------------
+    # De-duplicate looping audio
+    # -------------------------
+
+    cutoff_phrase = "if your color is called"
+    cutoff_index = transcription.lower().find(cutoff_phrase)
+
+    if cutoff_index != -1:
+        transcription = transcription[: cutoff_index + len(cutoff_phrase) + 1]
+
+    transcription = transcription.strip()
+
+    # -------------------------
+    # Detect color vs no-color day
+    # -------------------------
+
+    is_color_day = detect_color_day(transcription)
+
+    today = datetime.datetime.now().strftime("%A %m/%d/%Y")
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+
+    # -------------------------
+    # Log to Google Sheet
+    # -------------------------
+
+    log_sheet.append_row([
+        datetime.date.today().isoformat(),
+        timestamp,
+        call_sid,
+        transcription
+    ])
+
+    # -------------------------
+    # Build notification
+    # -------------------------
+
+    if is_color_day:
+        color_codes = extract_colors(transcription)
+
+        subject, body = color_day_notification(
+            date_str=today,
+            testing_center=TESTING_CENTER_NAME,
+            announcement_phone=ANNOUNCEMENT_PHONE,
+            color_codes=color_codes
+        )
+    else:
+        subject, body = no_color_day_notification(
+            date_str=today,
+            testing_center=TESTING_CENTER_NAME,
+            announcement_phone=ANNOUNCEMENT_PHONE
+        )
+
+    # -------------------------
+    # Send emails
+    # -------------------------
+
+    recipients = get_active_subscribers()
+
+    if recipients:
+        send_email(subject, body, recipients)
+        logging.info(f"Email sent to {len(recipients)} subscribers")
+    else:
+        logging.warning("No active subscribers found")
+
+    logging.info("Workflow complete")
