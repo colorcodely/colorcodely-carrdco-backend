@@ -1,24 +1,24 @@
 import os
-import json
-import base64
-import smtplib
 import logging
 import requests
-from datetime import datetime
+import smtplib
+import ssl
 from email.message import EmailMessage
+from datetime import datetime
 
+from twilio.rest import Client
 import gspread
 from google.oauth2.service_account import Credentials
 import openai
 
-# =========================
+# -------------------------------------------------
 # Logging
-# =========================
+# -------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 
-# =========================
-# Environment Variables
-# =========================
+# -------------------------------------------------
+# Required Environment Variables
+# -------------------------------------------------
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
@@ -32,113 +32,106 @@ SMTP_SERVER = os.environ["SMTP_SERVER"]
 SMTP_PORT = int(os.environ["SMTP_PORT"])
 SMTP_USERNAME = os.environ["SMTP_USERNAME"]
 SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
-SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
 SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 
-# =========================
-# OpenAI Setup (v0.28.x)
-# =========================
-openai.api_key = OPENAI_API_KEY
+NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
-# =========================
-# Download Recording
-# =========================
+# -------------------------------------------------
+# Clients
+# -------------------------------------------------
+openai.api_key = OPENAI_API_KEY
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
 def download_recording():
     logging.info("Downloading Twilio recording...")
-    r = requests.get(
+    response = requests.get(
         TWILIO_RECORDING_URL,
         auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
         timeout=30,
     )
-    r.raise_for_status()
-    return r.content
+    response.raise_for_status()
+    return response.content
 
-# =========================
-# Transcribe Audio
-# =========================
+
 def transcribe_audio(audio_bytes):
     logging.info("Transcribing audio...")
-    with open("recording.wav", "wb") as f:
+    with open("audio.wav", "wb") as f:
         f.write(audio_bytes)
 
-    with open("recording.wav", "rb") as audio_file:
+    with open("audio.wav", "rb") as audio_file:
         transcript = openai.Audio.transcribe(
             model="whisper-1",
-            file=audio_file
+            file=audio_file,
         )
 
-    text = transcript.get("text", "").strip()
-    return clean_transcription(text)
+    return transcript["text"]
 
-# =========================
-# Clean Repeated Phrases
-# =========================
-def clean_transcription(text):
-    cutoff = "you must report to drug screen"
-    if cutoff in text.lower():
-        idx = text.lower().find(cutoff)
-        return text[: idx + len(cutoff)].strip()
-    return text
 
-# =========================
-# Google Sheets
-# =========================
 def append_to_sheet(date_str, time_str, transcription):
     logging.info("Appending to Google Sheet...")
-    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+
     creds = Credentials.from_service_account_info(
-        creds_dict,
+        eval(GOOGLE_SERVICE_ACCOUNT_JSON),
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(GOOGLE_SHEET_ID)
-    worksheet = sheet.worksheet("DailyTranscriptions")
 
-    worksheet.append_row([
-        date_str,
-        time_str,
-        "",
-        "",
-        "",
-        transcription
-    ])
+    gc = gspread.authorize(creds)
+    sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 
-# =========================
-# Email Notification
-# =========================
+    sheet.append_row([date_str, time_str, transcription])
+
+
 def send_email(date_str, time_str, transcription):
     logging.info("Sending email notification...")
+
     msg = EmailMessage()
-    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    msg["To"] = SMTP_USERNAME
-    msg["Subject"] = "ColorCodely Daily Transcription"
+    msg["Subject"] = "ColorCodely Notification"
+    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_USERNAME}>"
+    msg["To"] = NOTIFY_EMAIL
 
     msg.set_content(
-        f"A new transcription has been recorded.\n\n"
-        f"Date: {date_str}\n"
-        f"Time: {time_str}\n\n"
-        f"Transcription:\n{transcription}"
+        f"""
+Color Code Notification
+
+DATE: {date_str}
+TIME: {time_str}
+
+TRANSCRIPTION:
+{transcription}
+""".strip()
     )
 
-    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(msg)
+    context = ssl.create_default_context()
 
-# =========================
+    # 🔑 IMPORTANT: Handle SSL vs STARTTLS correctly
+    if SMTP_PORT == 465:
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls(context=context)
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+
+
+# -------------------------------------------------
 # Main
-# =========================
+# -------------------------------------------------
 def main():
-    audio = download_recording()
-    transcription = transcribe_audio(audio)
+    audio_bytes = download_recording()
+    transcription = transcribe_audio(audio_bytes)
 
     now = datetime.now()
-    date_str = now.strftime("%Y-%m-%d")
+    date_str = now.strftime("%A %m/%d/%Y")
     time_str = now.strftime("%H:%M:%S")
 
     append_to_sheet(date_str, time_str, transcription)
     send_email(date_str, time_str, transcription)
 
-    logging.info("Transcription workflow completed successfully.")
 
 if __name__ == "__main__":
     main()
