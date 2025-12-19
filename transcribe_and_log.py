@@ -15,19 +15,15 @@ from googleapiclient.discovery import build
 # Environment Variables
 # =========================
 
-# OpenAI
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
-# Twilio
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
 
-# Google Sheets
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
-# Email / SMTP
 SMTP_SERVER = os.environ["SMTP_SERVER"]
 SMTP_PORT = int(os.environ["SMTP_PORT"])
 SMTP_USERNAME = os.environ["SMTP_USERNAME"]
@@ -36,42 +32,56 @@ SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
 SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 
 # =========================
-# Helper: normalize transcription
+# Helper: transcription cleanup
 # =========================
 
 def clean_transcription(text: str) -> str:
-    """
-    - Normalizes common Whisper errors (gold/goal → code)
-    - Stops at 'you must report to drug screen.'
-    - Capitalizes each sentence conservatively
-    """
-    lowered = text.lower().strip()
+    text = text.lower().strip()
 
     replacements = {
         "color gold": "color code",
         "color-goal": "color code",
         "color goal": "color code",
         "color-gold": "color code",
+        "city of huntsville": "City of Huntsville",
+        "huntsville": "Huntsville",
     }
 
     for bad, good in replacements.items():
-        lowered = lowered.replace(bad, good)
+        text = text.replace(bad, good)
 
     stop_phrase = "you must report to drug screen."
-    if stop_phrase in lowered:
-        lowered = lowered.split(stop_phrase)[0] + stop_phrase
+    if stop_phrase in text:
+        text = text.split(stop_phrase)[0] + stop_phrase
 
-    # Capitalize each sentence safely
-    sentences = lowered.split(". ")
-    sentences = [s.capitalize() for s in sentences if s]
+    # Capitalize sentences
+    sentences = [s.strip().capitalize() for s in text.split(".") if s.strip()]
+    text = ". ".join(sentences) + "."
 
-    return ". ".join(sentences).strip()
+    # Capitalize days and months explicitly
+    days = [
+        "monday", "tuesday", "wednesday",
+        "thursday", "friday", "saturday", "sunday"
+    ]
+    months = [
+        "january", "february", "march", "april",
+        "may", "june", "july", "august",
+        "september", "october", "november", "december"
+    ]
+
+    for d in days:
+        text = text.replace(d.capitalize(), d.capitalize())
+        text = text.replace(d, d.capitalize())
+
+    for m in months:
+        text = text.replace(m.capitalize(), m.capitalize())
+        text = text.replace(m, m.capitalize())
+
+    return text.strip()
 
 # =========================
-# Download Twilio Recording
+# Download recording
 # =========================
-
-print(f"Downloading recording: {TWILIO_RECORDING_URL}")
 
 response = requests.get(
     f"{TWILIO_RECORDING_URL}.wav",
@@ -84,10 +94,8 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
     f.write(response.content)
     audio_path = f.name
 
-print("Recording downloaded")
-
 # =========================
-# Transcribe with Whisper
+# Transcribe
 # =========================
 
 with open(audio_path, "rb") as audio_file:
@@ -99,16 +107,14 @@ with open(audio_path, "rb") as audio_file:
 raw_text = transcription["text"]
 text = clean_transcription(raw_text)
 
-print("Transcription complete")
-
 # =========================
-# Time (Correct CST/CDT)
+# Time (CST/CDT correct)
 # =========================
 
 now = datetime.now(tz=ZoneInfo("UTC")).astimezone(ZoneInfo("America/Chicago"))
 
 # =========================
-# Google Sheets Setup
+# Google Sheets
 # =========================
 
 creds = service_account.Credentials.from_service_account_info(
@@ -119,17 +125,13 @@ creds = service_account.Credentials.from_service_account_info(
 service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
 
-# =========================
-# Append to DailyTranscriptions
-# =========================
-
 row = [
-    now.strftime("%Y-%m-%d"),   # date
-    now.strftime("%H:%M:%S"),   # time (CST/CDT)
-    "",                         # source_call_sid (future)
-    "",                         # colors_detected (future)
-    "",                         # confidence (future)
-    text,                       # transcription
+    now.strftime("%Y-%m-%d"),
+    now.strftime("%H:%M:%S"),
+    "",
+    "",
+    "",
+    text,
 ]
 
 sheet.values().append(
@@ -139,35 +141,23 @@ sheet.values().append(
     body={"values": [row]},
 ).execute()
 
-print("DailyTranscriptions updated")
-
 # =========================
-# Fetch Active Subscribers
+# Active subscribers
 # =========================
 
-subscriber_result = sheet.values().get(
+result = sheet.values().get(
     spreadsheetId=GOOGLE_SHEET_ID,
     range="Subscribers!A2:G",
 ).execute()
 
-rows = subscriber_result.get("values", [])
-
-active_emails = []
-
-for row in rows:
-    if len(row) < 5:
-        continue
-
-    email = row[1].strip()
-    active_flag = row[4].strip().upper()
-
-    if email and active_flag == "YES":
-        active_emails.append(email)
-
-print(f"Active subscribers: {active_emails}")
+rows = result.get("values", [])
+active_emails = [
+    r[1].strip() for r in rows
+    if len(r) >= 5 and r[1].strip() and r[4].strip().upper() == "YES"
+]
 
 # =========================
-# Send Email to Active Subscribers
+# Email
 # =========================
 
 if active_emails:
@@ -187,23 +177,13 @@ RECORDING:
 Stay accountable, stay informed, and good luck on your journey!
 """
 
-    message = MIMEMultipart()
-    message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    message["To"] = ", ".join(active_emails)
-    message["Subject"] = subject
+    msg = MIMEMultipart()
+    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+    msg["To"] = ", ".join(active_emails)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
 
-    message.attach(MIMEText(body, "plain"))
-
-    try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.send_message(message)
-
-        print("Email sent to active subscribers")
-
-    except Exception as e:
-        print(f"Email sending failed: {e}")
-
-else:
-    print("No active subscribers found — no email sent")
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(msg)
