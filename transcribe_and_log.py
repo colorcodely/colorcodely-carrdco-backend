@@ -2,6 +2,7 @@ import os
 import requests
 import tempfile
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -39,7 +40,12 @@ SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 # =========================
 
 def clean_transcription(text: str) -> str:
-    text = text.strip()
+    """
+    - Normalizes common Whisper errors (gold/goal → code)
+    - Stops at 'you must report to drug screen.'
+    - Capitalizes each sentence conservatively
+    """
+    lowered = text.lower().strip()
 
     replacements = {
         "color gold": "color code",
@@ -48,7 +54,6 @@ def clean_transcription(text: str) -> str:
         "color-gold": "color code",
     }
 
-    lowered = text.lower()
     for bad, good in replacements.items():
         lowered = lowered.replace(bad, good)
 
@@ -56,8 +61,11 @@ def clean_transcription(text: str) -> str:
     if stop_phrase in lowered:
         lowered = lowered.split(stop_phrase)[0] + stop_phrase
 
-    # Capitalize first letter only (safe, non-destructive)
-    return lowered.capitalize()
+    # Capitalize each sentence safely
+    sentences = lowered.split(". ")
+    sentences = [s.capitalize() for s in sentences if s]
+
+    return ". ".join(sentences).strip()
 
 # =========================
 # Download Twilio Recording
@@ -94,6 +102,12 @@ text = clean_transcription(raw_text)
 print("Transcription complete")
 
 # =========================
+# Time (Correct CST/CDT)
+# =========================
+
+now = datetime.now(tz=ZoneInfo("UTC")).astimezone(ZoneInfo("America/Chicago"))
+
+# =========================
 # Google Sheets Setup
 # =========================
 
@@ -105,19 +119,17 @@ creds = service_account.Credentials.from_service_account_info(
 service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
 
-now = datetime.now()
-
 # =========================
 # Append to DailyTranscriptions
 # =========================
 
 row = [
-    now.strftime("%Y-%m-%d"),
-    now.strftime("%H:%M:%S"),
-    "",
-    "",
-    "",
-    text,
+    now.strftime("%Y-%m-%d"),   # date
+    now.strftime("%H:%M:%S"),   # time (CST/CDT)
+    "",                         # source_call_sid (future)
+    "",                         # colors_detected (future)
+    "",                         # confidence (future)
+    text,                       # transcription
 ]
 
 sheet.values().append(
@@ -159,18 +171,15 @@ print(f"Active subscribers: {active_emails}")
 # =========================
 
 if active_emails:
-    subject = "Daily Color Code Announcement – Powered by ColorCodely!"
-
-    formatted_date = now.strftime("%A, %m/%d/%Y")
-    formatted_time = now.strftime("%I:%M %p CST").lstrip("0")
+    subject = "Daily Color Code Announcement - Powered by ColorCodely!"
 
     body = f"""Daily Color Code Announcement - Powered by ColorCodely!
 
 TESTING LOCATION: City of Huntsville, AL Municipal Court - Probation Office
 RECORDED LINE: 256-427-7808
 
-DATE: {formatted_date}
-TIME: {formatted_time}
+DATE: {now.strftime("%A, %m/%d/%Y")}
+TIME: {now.strftime("%I:%M %p CST")}
 
 RECORDING:
 {text}
