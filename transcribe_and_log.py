@@ -1,109 +1,197 @@
 import os
 import requests
-import logging
-import datetime
+import tempfile
+from datetime import datetime
 import smtplib
-from email.message import EmailMessage
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
-import gspread
-from google.oauth2.service_account import Credentials
 import openai
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
-logging.basicConfig(level=logging.INFO)
+# =========================
+# Environment Variables
+# =========================
 
-# ======================
-# Environment variables
-# ======================
+# OpenAI
+openai.api_key = os.environ["OPENAI_API_KEY"]
 
+# Twilio
+TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
-GOOGLE_SHEET_NAME = os.environ["GOOGLE_SHEET_NAME"]
+# Google Sheets
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
+# Email / SMTP
 SMTP_SERVER = os.environ["SMTP_SERVER"]
 SMTP_PORT = int(os.environ["SMTP_PORT"])
 SMTP_USERNAME = os.environ["SMTP_USERNAME"]
 SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
-NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
+SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
+SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 
-openai.api_key = OPENAI_API_KEY
+# =========================
+# Helper: normalize transcription
+# =========================
 
+def clean_transcription(text: str) -> str:
+    """
+    - Stops at first occurrence of 'you must report to drug screen.'
+    - Fixes common Whisper errors (gold/goal -> code)
+    """
+    text = text.lower().strip()
 
-# ======================
-# Helper functions
-# ======================
+    replacements = {
+        "color gold": "color code",
+        "color-goal": "color code",
+        "color goal": "color code",
+        "color-gold": "color code",
+    }
 
-def download_recording(url):
-    logging.info("Downloading Twilio recording...")
-    audio = requests.get(url).content
-    with open("recording.wav", "wb") as f:
-        f.write(audio)
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
 
+    stop_phrase = "you must report to drug screen."
+    if stop_phrase in text:
+        text = text.split(stop_phrase)[0] + stop_phrase
 
-def transcribe_audio():
-    logging.info("Transcribing audio...")
-    with open("recording.wav", "rb") as audio_file:
-        transcript = openai.Audio.transcribe(
-            model="whisper-1",
-            file=audio_file
-        )
-    return transcript["text"]
+    return text.strip()
 
+# =========================
+# Download Twilio Recording
+# =========================
 
-def append_to_sheet(date_str, time_str, transcription):
-    logging.info("Appending to Google Sheet...")
+print(f"Downloading recording: {TWILIO_RECORDING_URL}")
 
-    creds_info = Credentials.from_service_account_info(
-        eval(GOOGLE_CREDS_JSON),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+response = requests.get(
+    f"{TWILIO_RECORDING_URL}.wav",
+    auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+    timeout=30,
+)
+response.raise_for_status()
+
+with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+    f.write(response.content)
+    audio_path = f.name
+
+print("Recording downloaded")
+
+# =========================
+# Transcribe with Whisper
+# =========================
+
+with open(audio_path, "rb") as audio_file:
+    transcription = openai.Audio.transcribe(
+        model="whisper-1",
+        file=audio_file,
     )
 
-    gc = gspread.authorize(creds_info)
-    sheet = gc.open(GOOGLE_SHEET_NAME).sheet1
+raw_text = transcription["text"]
+text = clean_transcription(raw_text)
 
-    sheet.append_row([
-        date_str,
-        time_str,
-        transcription
-    ])
+print("Transcription complete")
 
+# =========================
+# Google Sheets Setup
+# =========================
 
-def send_email(date_str, time_str, transcription):
-    logging.info("Sending email notification...")
+creds = service_account.Credentials.from_service_account_info(
+    eval(GOOGLE_SERVICE_ACCOUNT_JSON),
+    scopes=["https://www.googleapis.com/auth/spreadsheets"],
+)
 
-    msg = EmailMessage()
-    msg["Subject"] = "New Color Code Transcription"
-    msg["From"] = SMTP_USERNAME
-    msg["To"] = NOTIFY_EMAIL
+service = build("sheets", "v4", credentials=creds)
+sheet = service.spreadsheets()
 
-    msg.set_content(
-        f"Date: {date_str}\n"
-        f"Time: {time_str}\n\n"
-        f"Transcription:\n{transcription}"
-    )
+now = datetime.now()
 
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(msg)
+# =========================
+# Append to DailyTranscriptions
+# =========================
 
+row = [
+    now.strftime("%Y-%m-%d"),   # date
+    now.strftime("%H:%M:%S"),   # time
+    "",                         # source_call_sid (future)
+    "",                         # colors_detected (future)
+    "",                         # confidence (future)
+    text,                       # transcription
+]
 
-# ======================
-# Main
-# ======================
+sheet.values().append(
+    spreadsheetId=GOOGLE_SHEET_ID,
+    range="DailyTranscriptions!A:F",
+    valueInputOption="RAW",
+    body={"values": [row]},
+).execute()
 
-def main():
-    now = datetime.datetime.now()
-    date_str = now.strftime("%Y-%m-%d")
-    time_str = now.strftime("%H:%M:%S")
+print("DailyTranscriptions updated")
 
-    download_recording(TWILIO_RECORDING_URL)
-    transcription = transcribe_audio()
+# =========================
+# Fetch Active Subscribers
+# =========================
 
-    append_to_sheet(date_str, time_str, transcription)
-    send_email(date_str, time_str, transcription)
+subscriber_result = sheet.values().get(
+    spreadsheetId=GOOGLE_SHEET_ID,
+    range="Subscribers!A2:G",
+).execute()
 
+rows = subscriber_result.get("values", [])
 
-if __name__ == "__main__":
-    main()
+active_emails = []
+
+for row in rows:
+    if len(row) < 5:
+        continue
+
+    email = row[1].strip()
+    active_flag = row[4].strip().upper()
+
+    if email and active_flag == "YES":
+        active_emails.append(email)
+
+print(f"Active subscribers: {active_emails}")
+
+# =========================
+# Send Email to Active Subscribers
+# =========================
+
+if active_emails:
+    subject = "Daily Color Code Announcement"
+
+    body = f"""Hello,
+
+Here is today's recorded color code announcement:
+
+Date: {now.strftime("%Y-%m-%d")}
+Time: {now.strftime("%H:%M:%S")}
+
+{ text }
+
+This message was automatically generated.
+"""
+
+    message = MIMEMultipart()
+    message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+    message["To"] = ", ".join(active_emails)
+    message["Subject"] = subject
+
+    message.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(message)
+
+        print("Email sent to active subscribers")
+
+    except Exception as e:
+        print(f"Email sending failed: {e}")
+
+else:
+    print("No active subscribers found — no email sent")
