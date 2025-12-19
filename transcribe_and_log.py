@@ -39,11 +39,7 @@ SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 # =========================
 
 def clean_transcription(text: str) -> str:
-    """
-    - Stops at first occurrence of 'you must report to drug screen.'
-    - Fixes common Whisper errors (gold/goal -> code)
-    """
-    text = text.lower().strip()
+    text = text.strip()
 
     replacements = {
         "color gold": "color code",
@@ -52,14 +48,16 @@ def clean_transcription(text: str) -> str:
         "color-gold": "color code",
     }
 
+    lowered = text.lower()
     for bad, good in replacements.items():
-        text = text.replace(bad, good)
+        lowered = lowered.replace(bad, good)
 
     stop_phrase = "you must report to drug screen."
-    if stop_phrase in text:
-        text = text.split(stop_phrase)[0] + stop_phrase
+    if stop_phrase in lowered:
+        lowered = lowered.split(stop_phrase)[0] + stop_phrase
 
-    return text.strip()
+    # Capitalize first letter only (safe, non-destructive)
+    return lowered.capitalize()
 
 # =========================
 # Download Twilio Recording
@@ -114,12 +112,12 @@ now = datetime.now()
 # =========================
 
 row = [
-    now.strftime("%Y-%m-%d"),   # date
-    now.strftime("%H:%M:%S"),   # time
-    "",                         # source_call_sid (future)
-    "",                         # colors_detected (future)
-    "",                         # confidence (future)
-    text,                       # transcription
+    now.strftime("%Y-%m-%d"),
+    now.strftime("%H:%M:%S"),
+    "",
+    "",
+    "",
+    text,
 ]
 
 sheet.values().append(
@@ -161,18 +159,23 @@ print(f"Active subscribers: {active_emails}")
 # =========================
 
 if active_emails:
-    subject = "Daily Color Code Announcement"
+    subject = "Daily Color Code Announcement – Powered by ColorCodely!"
 
-    body = f"""Hello,
+    formatted_date = now.strftime("%A, %m/%d/%Y")
+    formatted_time = now.strftime("%I:%M %p CST").lstrip("0")
 
-Here is today's recorded color code announcement:
+    body = f"""Daily Color Code Announcement - Powered by ColorCodely!
 
-Date: {now.strftime("%Y-%m-%d")}
-Time: {now.strftime("%H:%M:%S")}
+TESTING LOCATION: City of Huntsville, AL Municipal Court - Probation Office
+RECORDED LINE: 256-427-7808
 
-{ text }
+DATE: {formatted_date}
+TIME: {formatted_time}
 
-This message was automatically generated.
+RECORDING:
+{text}
+
+Stay accountable, stay informed, and good luck on your journey!
 """
 
     message = MIMEMultipart()
