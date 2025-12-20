@@ -58,7 +58,7 @@ def clean_transcription(text: str) -> str:
     sentences = [s.strip().capitalize() for s in text.split(".") if s.strip()]
     text = ". ".join(sentences) + "."
 
-    # Capitalize days and months explicitly
+    # Capitalize days and months
     days = [
         "monday", "tuesday", "wednesday",
         "thursday", "friday", "saturday", "sunday"
@@ -106,7 +106,7 @@ raw_text = transcription["text"]
 text = clean_transcription(raw_text)
 
 # =========================
-# Time (CST/CDT correct)
+# Time (CST / CDT)
 # =========================
 
 now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
@@ -162,26 +162,20 @@ active_emails = [
 # =========================
 
 if active_emails:
-    subject = "Daily Color Code Announcement – Powered by ColorCodely!"
+    subject = "📣 Daily Color Code Announcement – Powered by ColorCodely!"
 
-    body = f"""Daily Color Code Announcement – Powered by ColorCodely!
+    body = f"""📣 Daily Color Code Announcement – Powered by ColorCodely!
 
-📍 TESTING LOCATION:
-City of Huntsville, AL Municipal Court – Probation Office
+📍 TESTING LOCATION:  City of Huntsville, AL Municipal Court – Probation Office
+📞 RECORDED LINE:  256-427-7808
 
-📞 RECORDED LINE:
-256-427-7808
+📅 DATE:  {now.strftime("%A, %m/%d/%Y")}
+🕒 TIME:  {now.strftime("%I:%M %p CST")}
 
-📅 DATE:
-{now.strftime("%A, %m/%d/%Y")}
-
-🕒 TIME:
-{now.strftime("%I:%M %p CST")}
-
-🎨 COLOR CODE ANNOUNCEMENT:
+🎨 RECORDING:
 {text}
 
-Stay accountable, stay informed, and good luck on your journey!
+👍 Stay accountable, stay informed, and good luck on your journey!
 """
 
     msg = MIMEMultipart()
