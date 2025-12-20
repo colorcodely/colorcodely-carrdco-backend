@@ -38,27 +38,38 @@ SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 def clean_transcription(text: str) -> str:
     text = text.lower().strip()
 
+    # Fix common Whisper errors
     replacements = {
         "color gold": "color code",
         "color-goal": "color code",
         "color goal": "color code",
         "color-gold": "color code",
-        "city of huntsville": "City of Huntsville",
-        "huntsville": "Huntsville",
     }
 
     for bad, good in replacements.items():
         text = text.replace(bad, good)
 
+    # Stop at loop boundary
     stop_phrase = "you must report to drug screen."
     if stop_phrase in text:
         text = text.split(stop_phrase)[0] + stop_phrase
 
-    # Capitalize sentences
+    # Capitalize sentences WITHOUT destroying proper nouns later
     sentences = [s.strip().capitalize() for s in text.split(".") if s.strip()]
-    text = ". ".join(sentences) + "."
+    text = ". ".join(sentences)
+    if not text.endswith("."):
+        text += "."
 
-    # Capitalize days and months explicitly
+    # Enforce proper nouns AFTER sentence casing
+    proper_nouns = {
+        "city of huntsville": "City of Huntsville",
+        "huntsville": "Huntsville",
+    }
+
+    for bad, good in proper_nouns.items():
+        text = text.replace(bad, good)
+
+    # Capitalize days and months
     days = [
         "monday", "tuesday", "wednesday",
         "thursday", "friday", "saturday", "sunday"
@@ -70,11 +81,9 @@ def clean_transcription(text: str) -> str:
     ]
 
     for d in days:
-        text = text.replace(d.capitalize(), d.capitalize())
         text = text.replace(d, d.capitalize())
 
     for m in months:
-        text = text.replace(m.capitalize(), m.capitalize())
         text = text.replace(m, m.capitalize())
 
     return text.strip()
@@ -152,7 +161,8 @@ result = sheet.values().get(
 
 rows = result.get("values", [])
 active_emails = [
-    r[1].strip() for r in rows
+    r[1].strip()
+    for r in rows
     if len(r) >= 5 and r[1].strip() and r[4].strip().upper() == "YES"
 ]
 
