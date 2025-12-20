@@ -38,38 +38,27 @@ SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 def clean_transcription(text: str) -> str:
     text = text.lower().strip()
 
-    # Fix common Whisper errors
     replacements = {
         "color gold": "color code",
         "color-goal": "color code",
         "color goal": "color code",
         "color-gold": "color code",
+        "city of huntsville": "City of Huntsville",
+        "huntsville": "Huntsville",
     }
 
     for bad, good in replacements.items():
         text = text.replace(bad, good)
 
-    # Stop at loop boundary
     stop_phrase = "you must report to drug screen."
     if stop_phrase in text:
         text = text.split(stop_phrase)[0] + stop_phrase
 
-    # Capitalize sentences WITHOUT destroying proper nouns later
+    # Capitalize sentences
     sentences = [s.strip().capitalize() for s in text.split(".") if s.strip()]
-    text = ". ".join(sentences)
-    if not text.endswith("."):
-        text += "."
+    text = ". ".join(sentences) + "."
 
-    # Enforce proper nouns AFTER sentence casing
-    proper_nouns = {
-        "city of huntsville": "City of Huntsville",
-        "huntsville": "Huntsville",
-    }
-
-    for bad, good in proper_nouns.items():
-        text = text.replace(bad, good)
-
-    # Capitalize days and months
+    # Capitalize days and months explicitly
     days = [
         "monday", "tuesday", "wednesday",
         "thursday", "friday", "saturday", "sunday"
@@ -120,7 +109,9 @@ text = clean_transcription(raw_text)
 # Time (CST/CDT correct)
 # =========================
 
-now = datetime.now(tz=ZoneInfo("UTC")).astimezone(ZoneInfo("America/Chicago"))
+now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
+    ZoneInfo("America/Chicago")
+)
 
 # =========================
 # Google Sheets
@@ -167,21 +158,27 @@ active_emails = [
 ]
 
 # =========================
-# Email
+# Email (Plain Text + Emojis)
 # =========================
 
 if active_emails:
-    subject = "Daily Color Code Announcement - Powered by ColorCodely!"
+    subject = "Daily Color Code Announcement – Powered by ColorCodely!"
 
-    body = f"""Daily Color Code Announcement - Powered by ColorCodely!
+    body = f"""Daily Color Code Announcement – Powered by ColorCodely!
 
-TESTING LOCATION: City of Huntsville, AL Municipal Court - Probation Office
-RECORDED LINE: 256-427-7808
+📍 TESTING LOCATION:
+City of Huntsville, AL Municipal Court – Probation Office
 
-DATE: {now.strftime("%A, %m/%d/%Y")}
-TIME: {now.strftime("%I:%M %p CST")}
+📞 RECORDED LINE:
+256-427-7808
 
-RECORDING:
+📅 DATE:
+{now.strftime("%A, %m/%d/%Y")}
+
+🕒 TIME:
+{now.strftime("%I:%M %p CST")}
+
+🎨 COLOR CODE ANNOUNCEMENT:
 {text}
 
 Stay accountable, stay informed, and good luck on your journey!
