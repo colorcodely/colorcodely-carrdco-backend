@@ -54,7 +54,7 @@ def clean_transcription(text: str) -> str:
     if stop_phrase in text:
         text = text.split(stop_phrase)[0] + stop_phrase
 
-    # Sentence capitalization
+    # Capitalize sentences
     sentences = [s.strip().capitalize() for s in text.split(".") if s.strip()]
     text = ". ".join(sentences) + "."
 
@@ -78,7 +78,7 @@ def clean_transcription(text: str) -> str:
     return text.strip()
 
 # =========================
-# Download recording
+# Download Twilio recording
 # =========================
 
 response = requests.get(
@@ -93,7 +93,7 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
     audio_path = f.name
 
 # =========================
-# Transcribe
+# Transcribe with Whisper
 # =========================
 
 with open(audio_path, "rb") as audio_file:
@@ -106,7 +106,7 @@ raw_text = transcription["text"]
 text = clean_transcription(raw_text)
 
 # =========================
-# Time (CST/CDT correct)
+# Time (America/Chicago)
 # =========================
 
 now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
@@ -142,7 +142,7 @@ sheet.values().append(
 ).execute()
 
 # =========================
-# Active subscribers
+# Fetch active subscribers
 # =========================
 
 result = sheet.values().get(
@@ -151,6 +151,7 @@ result = sheet.values().get(
 ).execute()
 
 rows = result.get("values", [])
+
 active_emails = [
     r[1].strip()
     for r in rows
@@ -158,7 +159,7 @@ active_emails = [
 ]
 
 # =========================
-# Email
+# Send Email (BCC only)
 # =========================
 
 if active_emails:
@@ -179,7 +180,8 @@ if active_emails:
 
     msg = MIMEMultipart()
     msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    msg["To"] = ", ".join(active_emails)
+    msg["To"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+    msg["Bcc"] = ", ".join(active_emails)
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
