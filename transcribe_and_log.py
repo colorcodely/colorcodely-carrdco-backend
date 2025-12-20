@@ -54,7 +54,7 @@ def clean_transcription(text: str) -> str:
     if stop_phrase in text:
         text = text.split(stop_phrase)[0] + stop_phrase
 
-    # Capitalize sentences
+    # Sentence capitalization
     sentences = [s.strip().capitalize() for s in text.split(".") if s.strip()]
     text = ". ".join(sentences) + "."
 
@@ -106,7 +106,7 @@ raw_text = transcription["text"]
 text = clean_transcription(raw_text)
 
 # =========================
-# Time (CST / CDT)
+# Time (CST/CDT correct)
 # =========================
 
 now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
@@ -158,22 +158,21 @@ active_emails = [
 ]
 
 # =========================
-# Email (Plain Text + Emojis)
+# Email
 # =========================
 
 if active_emails:
-    subject = "📣 Daily Color Code Announcement – Powered by ColorCodely!"
+    subject = "Daily Color Code Announcement - Powered by ColorCodely!"
 
-    body = f"""📣 Daily Color Code Announcement – Powered by ColorCodely!
+    body = f"""📣 Daily Color Code Announcement - Powered by ColorCodely!
 
-📍 TESTING LOCATION:  City of Huntsville, AL Municipal Court – Probation Office
-📞 RECORDED LINE:  256-427-7808
+📍 TESTING LOCATION:  City of Huntsville, AL Municipal Court - Probation Office
+☎️ RECORDED LINE:     256-427-7808
 
 📅 DATE:  {now.strftime("%A, %m/%d/%Y")}
 🕒 TIME:  {now.strftime("%I:%M %p CST")}
 
-🎨 RECORDING:
-{text}
+🎤 RECORDING:  {text}
 
 👍 Stay accountable, stay informed, and good luck on your journey!
 """
