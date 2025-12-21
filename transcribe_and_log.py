@@ -78,7 +78,7 @@ def clean_transcription(text: str) -> str:
     return text.strip()
 
 # =========================
-# Download Twilio recording
+# Download recording
 # =========================
 
 response = requests.get(
@@ -93,7 +93,7 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
     audio_path = f.name
 
 # =========================
-# Transcribe with Whisper
+# Transcribe
 # =========================
 
 with open(audio_path, "rb") as audio_file:
@@ -109,9 +109,7 @@ text = clean_transcription(raw_text)
 # Time (America/Chicago)
 # =========================
 
-now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
-    ZoneInfo("America/Chicago")
-)
+now = datetime.now(tz=ZoneInfo("UTC")).astimezone(ZoneInfo("America/Chicago"))
 
 # =========================
 # Google Sheets
@@ -142,7 +140,7 @@ sheet.values().append(
 ).execute()
 
 # =========================
-# Fetch active subscribers
+# Active subscribers
 # =========================
 
 result = sheet.values().get(
@@ -151,15 +149,13 @@ result = sheet.values().get(
 ).execute()
 
 rows = result.get("values", [])
-
 active_emails = [
-    r[1].strip()
-    for r in rows
+    r[1].strip() for r in rows
     if len(r) >= 5 and r[1].strip() and r[4].strip().upper() == "YES"
 ]
 
 # =========================
-# Send Email (BCC only)
+# Email (DAILY)
 # =========================
 
 if active_emails:
@@ -167,21 +163,28 @@ if active_emails:
 
     body = f"""📣 Daily Color Code Announcement - Powered by ColorCodely!
 
-📍 TESTING LOCATION:  City of Huntsville, AL Municipal Court - Probation Office
-☎️ RECORDED LINE:     256-427-7808
+🏛️ TESTING LOCATION:  City of Huntsville, AL Municipal Court – Probation Office
+☎️ RECORDED LINE:  256-427-7808
 
 📅 DATE:  {now.strftime("%A, %m/%d/%Y")}
 🕒 TIME:  {now.strftime("%I:%M %p CST")}
 
-🎤 RECORDING:  {text}
+🎤 RECORDING:
+{text}
 
 👍 Stay accountable, stay informed, and good luck on your journey!
+
+You are receiving this email because you subscribed to ColorCodely alerts.
+
+ColorCodely
+📧 colorcodely@gmail.com
+🌐 https://colorcodely.carrd.co
+🚀 Huntsville, AL
 """
 
     msg = MIMEMultipart()
     msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    msg["To"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    msg["Bcc"] = ", ".join(active_emails)
+    msg["To"] = ", ".join(active_emails)
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
