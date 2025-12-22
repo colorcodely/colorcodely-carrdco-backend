@@ -38,47 +38,72 @@ SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 def clean_transcription(text: str) -> str:
     text = text.lower().strip()
 
+    # Fix common Whisper mishearings
     replacements = {
         "color gold": "color code",
-        "color-goal": "color code",
         "color goal": "color code",
+        "color-goal": "color code",
         "color-gold": "color code",
-        "city of huntsville": "City of Huntsville",
-        "huntsville": "Huntsville",
+        "color coat": "color code",
+        "drug street": "drug screen",
     }
 
     for bad, good in replacements.items():
         text = text.replace(bad, good)
 
+    # Stop at official end phrase if present
     stop_phrase = "you must report to drug screen."
     if stop_phrase in text:
         text = text.split(stop_phrase)[0] + stop_phrase
 
-    # Capitalize sentences
-    sentences = [s.strip().capitalize() for s in text.split(".") if s.strip()]
-    text = ". ".join(sentences) + "."
+    # Split into sentences and deduplicate
+    sentences = []
+    seen = set()
+
+    for s in text.split("."):
+        s = s.strip()
+        if not s:
+            continue
+        s_cap = s.capitalize()
+        if s_cap not in seen:
+            sentences.append(s_cap)
+            seen.add(s_cap)
+
+    text = ". ".join(sentences)
+    if not text.endswith("."):
+        text += "."
+
+    # Force proper nouns
+    proper_replacements = {
+        "City of huntsville": "City of Huntsville",
+        "city of huntsville": "City of Huntsville",
+        "huntsville": "Huntsville",
+    }
+
+    for bad, good in proper_replacements.items():
+        text = text.replace(bad, good)
 
     # Capitalize days and months
     days = [
-        "monday", "tuesday", "wednesday",
-        "thursday", "friday", "saturday", "sunday"
+        "Monday", "Tuesday", "Wednesday",
+        "Thursday", "Friday", "Saturday", "Sunday"
     ]
     months = [
-        "january", "february", "march", "april",
-        "may", "june", "july", "august",
-        "september", "october", "november", "december"
+        "January", "February", "March", "April",
+        "May", "June", "July", "August",
+        "September", "October", "November", "December"
     ]
 
     for d in days:
-        text = text.replace(d, d.capitalize())
+        text = text.replace(d.lower(), d)
 
     for m in months:
-        text = text.replace(m, m.capitalize())
+        text = text.replace(m.lower(), m)
 
     return text.strip()
 
 # =========================
-# Download recording
+# Download Twilio Recording
 # =========================
 
 response = requests.get(
@@ -93,7 +118,7 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
     audio_path = f.name
 
 # =========================
-# Transcribe
+# Transcribe with Whisper
 # =========================
 
 with open(audio_path, "rb") as audio_file:
@@ -106,10 +131,12 @@ raw_text = transcription["text"]
 text = clean_transcription(raw_text)
 
 # =========================
-# Time (America/Chicago)
+# Time (CST/CDT safe)
 # =========================
 
-now = datetime.now(tz=ZoneInfo("UTC")).astimezone(ZoneInfo("America/Chicago"))
+now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
+    ZoneInfo("America/Chicago")
+)
 
 # =========================
 # Google Sheets
@@ -140,7 +167,7 @@ sheet.values().append(
 ).execute()
 
 # =========================
-# Active subscribers
+# Active Subscribers
 # =========================
 
 result = sheet.values().get(
@@ -149,25 +176,27 @@ result = sheet.values().get(
 ).execute()
 
 rows = result.get("values", [])
+
 active_emails = [
-    r[1].strip() for r in rows
+    r[1].strip()
+    for r in rows
     if len(r) >= 5 and r[1].strip() and r[4].strip().upper() == "YES"
 ]
 
 # =========================
-# Email (DAILY)
+# Email Notification
 # =========================
 
 if active_emails:
-    subject = "Daily Color Code Announcement - Powered by ColorCodely!"
+    subject = "📣 Daily Color Code Announcement - Powered by ColorCodely!"
 
     body = f"""📣 Daily Color Code Announcement - Powered by ColorCodely!
 
-🏛️ TESTING LOCATION:  City of Huntsville, AL Municipal Court – Probation Office
-☎️ RECORDED LINE:  256-427-7808
+🏛️ TESTING LOCATION: City of Huntsville, AL Municipal Court – Probation Office
+☎️ RECORDED LINE: 256-427-7808
 
-📅 DATE:  {now.strftime("%A, %m/%d/%Y")}
-🕒 TIME:  {now.strftime("%I:%M %p CST")}
+📅 DATE: {now.strftime("%A, %m/%d/%Y")}
+🕒 TIME: {now.strftime("%I:%M %p CST")}
 
 🎤 RECORDING:
 {text}
