@@ -31,6 +31,23 @@ SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
 SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
 SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 
+TESTING_CENTER = os.environ["TESTING_CENTER"]
+TARGET_SHEET = os.environ["TARGET_SHEET"]
+RECORDED_LINE = os.environ["RECORDED_LINE"]
+
+# =========================
+# Time (CST/CDT safe)
+# =========================
+
+now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
+    ZoneInfo("America/Chicago")
+)
+
+# Skip weekends for MCOAS
+if TESTING_CENTER == "AL_HSV_MCOAS" and now.weekday() >= 5:
+    print("MCOAS does not announce colors on weekends. Exiting.")
+    exit(0)
+
 # =========================
 # Helper: transcription cleanup
 # =========================
@@ -38,7 +55,6 @@ SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 def clean_transcription(text: str) -> str:
     text = text.lower().strip()
 
-    # Fix common Whisper mishearings
     replacements = {
         "color gold": "color code",
         "color goal": "color code",
@@ -51,12 +67,10 @@ def clean_transcription(text: str) -> str:
     for bad, good in replacements.items():
         text = text.replace(bad, good)
 
-    # Stop at official end phrase if present
     stop_phrase = "you must report to drug screen."
     if stop_phrase in text:
         text = text.split(stop_phrase)[0] + stop_phrase
 
-    # Split into sentences and deduplicate
     sentences = []
     seen = set()
 
@@ -73,9 +87,7 @@ def clean_transcription(text: str) -> str:
     if not text.endswith("."):
         text += "."
 
-    # Force proper nouns
     proper_replacements = {
-        "City of huntsville": "City of Huntsville",
         "city of huntsville": "City of Huntsville",
         "huntsville": "Huntsville",
     }
@@ -83,7 +95,6 @@ def clean_transcription(text: str) -> str:
     for bad, good in proper_replacements.items():
         text = text.replace(bad, good)
 
-    # Capitalize days and months
     days = [
         "Monday", "Tuesday", "Wednesday",
         "Thursday", "Friday", "Saturday", "Sunday"
@@ -131,14 +142,6 @@ raw_text = transcription["text"]
 text = clean_transcription(raw_text)
 
 # =========================
-# Time (CST/CDT safe)
-# =========================
-
-now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
-    ZoneInfo("America/Chicago")
-)
-
-# =========================
 # Google Sheets
 # =========================
 
@@ -161,13 +164,13 @@ row = [
 
 sheet.values().append(
     spreadsheetId=GOOGLE_SHEET_ID,
-    range="DailyTranscriptions!A:F",
+    range=f"{TARGET_SHEET}!A:F",
     valueInputOption="RAW",
     body={"values": [row]},
 ).execute()
 
 # =========================
-# Active Subscribers
+# Active Subscribers (by testing center)
 # =========================
 
 result = sheet.values().get(
@@ -180,7 +183,12 @@ rows = result.get("values", [])
 active_emails = [
     r[1].strip()
     for r in rows
-    if len(r) >= 5 and r[1].strip() and r[4].strip().upper() == "YES"
+    if (
+        len(r) >= 5
+        and r[1].strip()
+        and r[4].strip().upper() == "YES"
+        and r[3].strip() == TESTING_CENTER
+    )
 ]
 
 # =========================
@@ -190,10 +198,16 @@ active_emails = [
 if active_emails:
     subject = "📣 Daily Color Code Announcement - Powered by ColorCodely!"
 
+    testing_location = (
+        "City of Huntsville, AL Municipal Court – Probation Office"
+        if TESTING_CENTER == "AL_HSV_Municipal_Court"
+        else "Madison County Office of Alternative Sentencing"
+    )
+
     body = f"""📣 Daily Color Code Announcement - Powered by ColorCodely!
 
-🏛️ TESTING LOCATION: City of Huntsville, AL Municipal Court – Probation Office
-☎️ RECORDED LINE: 256-427-7808
+🏛️ TESTING LOCATION: {testing_location}
+☎️ RECORDED LINE: {RECORDED_LINE}
 
 📅 DATE: {now.strftime("%A, %m/%d/%Y")}
 🕒 TIME: {now.strftime("%I:%M %p CST")}
@@ -213,7 +227,7 @@ ColorCodely
 
     msg = MIMEMultipart()
     msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    msg["To"] = ", ".join(active_emails)
+    msg["Bcc"] = ", ".join(active_emails)
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
