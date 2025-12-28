@@ -6,17 +6,13 @@ from zoneinfo import ZoneInfo
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-
 import openai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# =========================
-# Environment Variables
-# =========================
-
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
+TESTING_CENTER = os.environ["TESTING_CENTER"]
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_RECORDING_URL = os.environ["TWILIO_RECORDING_URL"]
@@ -31,85 +27,36 @@ SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
 SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
 SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 
-# =========================
-# Helper: transcription cleanup
-# =========================
+CENTER_CONFIG = {
+    "AL_HSV_Municipal_Court": {
+        "location": "City of Huntsville, AL Municipal Court – Probation Office",
+        "phone": "256-427-7808",
+        "sheet": "DailyTranscriptions",
+    },
+    "AL_HSV_MCOAS": {
+        "location": "Madison County Office of Alternative Sentencing",
+        "phone": "256-533-8943",
+        "sheet": "MCOAS_DailyTranscriptions",
+    },
+}
+
+cfg = CENTER_CONFIG[TESTING_CENTER]
 
 def clean_transcription(text: str) -> str:
-    text = text.lower().strip()
-
-    # Fix common Whisper mishearings
-    replacements = {
-        "color gold": "color code",
-        "color goal": "color code",
-        "color-goal": "color code",
-        "color-gold": "color code",
+    fixes = {
         "color coat": "color code",
+        "color gold": "color code",
         "drug street": "drug screen",
     }
+    text = text.lower()
+    for k, v in fixes.items():
+        text = text.replace(k, v)
+    return text.capitalize()
 
-    for bad, good in replacements.items():
-        text = text.replace(bad, good)
-
-    # Stop at official end phrase if present
-    stop_phrase = "you must report to drug screen."
-    if stop_phrase in text:
-        text = text.split(stop_phrase)[0] + stop_phrase
-
-    # Split into sentences and deduplicate
-    sentences = []
-    seen = set()
-
-    for s in text.split("."):
-        s = s.strip()
-        if not s:
-            continue
-        s_cap = s.capitalize()
-        if s_cap not in seen:
-            sentences.append(s_cap)
-            seen.add(s_cap)
-
-    text = ". ".join(sentences)
-    if not text.endswith("."):
-        text += "."
-
-    # Force proper nouns
-    proper_replacements = {
-        "City of huntsville": "City of Huntsville",
-        "city of huntsville": "City of Huntsville",
-        "huntsville": "Huntsville",
-    }
-
-    for bad, good in proper_replacements.items():
-        text = text.replace(bad, good)
-
-    # Capitalize days and months
-    days = [
-        "Monday", "Tuesday", "Wednesday",
-        "Thursday", "Friday", "Saturday", "Sunday"
-    ]
-    months = [
-        "January", "February", "March", "April",
-        "May", "June", "July", "August",
-        "September", "October", "November", "December"
-    ]
-
-    for d in days:
-        text = text.replace(d.lower(), d)
-
-    for m in months:
-        text = text.replace(m.lower(), m)
-
-    return text.strip()
-
-# =========================
-# Download Twilio Recording
-# =========================
-
+# Download recording
 response = requests.get(
     f"{TWILIO_RECORDING_URL}.wav",
     auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-    timeout=30,
 )
 response.raise_for_status()
 
@@ -117,30 +64,12 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
     f.write(response.content)
     audio_path = f.name
 
-# =========================
-# Transcribe with Whisper
-# =========================
-
 with open(audio_path, "rb") as audio_file:
-    transcription = openai.Audio.transcribe(
-        model="whisper-1",
-        file=audio_file,
-    )
+    transcription = openai.Audio.transcribe("whisper-1", audio_file)
 
-raw_text = transcription["text"]
-text = clean_transcription(raw_text)
+text = clean_transcription(transcription["text"])
 
-# =========================
-# Time (CST/CDT safe)
-# =========================
-
-now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
-    ZoneInfo("America/Chicago")
-)
-
-# =========================
-# Google Sheets
-# =========================
+now = datetime.now(tz=ZoneInfo("America/Chicago"))
 
 creds = service_account.Credentials.from_service_account_info(
     eval(GOOGLE_SERVICE_ACCOUNT_JSON),
@@ -150,74 +79,42 @@ creds = service_account.Credentials.from_service_account_info(
 service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
 
-row = [
-    now.strftime("%Y-%m-%d"),
-    now.strftime("%H:%M:%S"),
-    "",
-    "",
-    "",
-    text,
-]
-
 sheet.values().append(
     spreadsheetId=GOOGLE_SHEET_ID,
-    range="DailyTranscriptions!A:F",
+    range=f"{cfg['sheet']}!A:F",
     valueInputOption="RAW",
-    body={"values": [row]},
+    body={"values": [[now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), "", "", "", text]]},
 ).execute()
 
-# =========================
-# Active Subscribers
-# =========================
-
-result = sheet.values().get(
+subs = sheet.values().get(
     spreadsheetId=GOOGLE_SHEET_ID,
     range="Subscribers!A2:G",
-).execute()
+).execute().get("values", [])
 
-rows = result.get("values", [])
-
-active_emails = [
-    r[1].strip()
-    for r in rows
-    if len(r) >= 5 and r[1].strip() and r[4].strip().upper() == "YES"
+emails = [
+    r[1]
+    for r in subs
+    if r[4].upper() == "YES" and r[3] == TESTING_CENTER
 ]
 
-# =========================
-# Email Notification
-# =========================
+if emails:
+    msg = MIMEMultipart()
+    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+    msg["To"] = ", ".join(emails)
+    msg["Subject"] = "📣 Daily Color Code Announcement - Powered by ColorCodely!"
 
-if active_emails:
-    subject = "📣 Daily Color Code Announcement - Powered by ColorCodely!"
+    msg.attach(MIMEText(f"""
+🏛️ TESTING LOCATION: {cfg['location']}
+☎️ RECORDED LINE: {cfg['phone']}
 
-    body = f"""📣 Daily Color Code Announcement - Powered by ColorCodely!
-
-🏛️ TESTING LOCATION: City of Huntsville, AL Municipal Court – Probation Office
-☎️ RECORDED LINE: 256-427-7808
-
-📅 DATE: {now.strftime("%A, %m/%d/%Y")}
-🕒 TIME: {now.strftime("%I:%M %p CST")}
+📅 DATE: {now.strftime('%A, %m/%d/%Y')}
+🕒 TIME: {now.strftime('%I:%M %p CST')}
 
 🎤 RECORDING:
 {text}
+""", "plain"))
 
-👍 Stay accountable, stay informed, and good luck on your journey!
-
-You are receiving this email because you subscribed to ColorCodely alerts.
-
-ColorCodely
-📧 colorcodely@gmail.com
-🌐 https://colorcodely.carrd.co
-🚀 Huntsville, AL
-"""
-
-    msg = MIMEMultipart()
-    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    msg["To"] = ", ".join(active_emails)
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(msg)
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
+        s.starttls()
+        s.login(SMTP_USERNAME, SMTP_PASSWORD)
+        s.send_message(msg)
