@@ -1,6 +1,8 @@
 import os
 import logging
 import requests
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, request, Response
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
@@ -17,16 +19,12 @@ TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
 
-# Primary testing center (Huntsville Municipal Court)
-TWILIO_TO_NUMBER = os.environ["TWILIO_TO_NUMBER"]
-
-# Secondary testing center (Madison County Office of Alternative Sentencing)
-TWILIO_TO_NUMBER_MCOAS = os.environ["TWILIO_TO_NUMBER_MCOAS"]
+TWILIO_TO_NUMBER_HSV = os.environ["TWILIO_TO_NUMBER"]          # Huntsville
+TWILIO_TO_NUMBER_MCOAS = os.environ["TWILIO_TO_NUMBER_MCOAS"]  # MCOAS
 
 # GitHub
 GH_ACTIONS_TOKEN = os.environ["GH_ACTIONS_TOKEN"]
-GITHUB_REPO = os.environ["GITHUB_REPO"]
-
+GITHUB_REPO = os.environ["GITHUB_REPO"]  # e.g. "colorcodely/colorcodely-carrdco-backend"
 GITHUB_DISPATCH_URL = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -45,41 +43,73 @@ def health():
 
 @app.route("/daily-call", methods=["POST"])
 def daily_call():
-    """Calls Huntsville Municipal Court"""
-    call = client.calls.create(
-        to=TWILIO_TO_NUMBER,
+    now = datetime.now(tz=ZoneInfo("America/Chicago"))
+    weekday = now.weekday()  # Monday=0, Sunday=6
+
+    headers = {
+        "Authorization": f"token {GH_ACTIONS_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    # -------------------------
+    # 1️⃣ Huntsville Municipal Court (daily)
+    # -------------------------
+
+    call_hsv = client.calls.create(
+        to=TWILIO_TO_NUMBER_HSV,
         from_=TWILIO_FROM_NUMBER,
-        url=f"{request.url_root}twiml/record?center=AL_HSV_MUNICIPAL",
+        url=f"{request.url_root}twiml/record",
         method="POST",
         timeout=45
     )
 
-    logging.info(f"Huntsville call started: {call.sid}")
-    return {"call_sid": call.sid}, 200
+    logging.info(f"Huntsville call started: {call_hsv.sid}")
 
+    payload_hsv = {
+        "event_type": "twilio-recording",
+        "client_payload": {
+            "call_sid": call_hsv.sid
+        }
+    }
 
-@app.route("/daily-call-mcoas", methods=["POST"])
-def daily_call_mcoas():
-    """Calls Madison County Office of Alternative Sentencing"""
-    call = client.calls.create(
-        to=TWILIO_TO_NUMBER_MCOAS,
-        from_=TWILIO_FROM_NUMBER,
-        url=f"{request.url_root}twiml/record?center=AL_HSV_MCOAS",
-        method="POST",
-        timeout=45
-    )
+    requests.post(GITHUB_DISPATCH_URL, json=payload_hsv, headers=headers)
 
-    logging.info(f"MCOAS call started: {call.sid}")
-    return {"call_sid": call.sid}, 200
+    # -------------------------
+    # 2️⃣ Madison County Office of Alternative Sentencing
+    #     (Weekdays only)
+    # -------------------------
+
+    if weekday < 5:  # Mon–Fri only
+        call_mcoas = client.calls.create(
+            to=TWILIO_TO_NUMBER_MCOAS,
+            from_=TWILIO_FROM_NUMBER,
+            url=f"{request.url_root}twiml/record",
+            method="POST",
+            timeout=45
+        )
+
+        logging.info(f"MCOAS call started: {call_mcoas.sid}")
+
+        payload_mcoas = {
+            "event_type": "twilio-recording-AL_HSV_MCOAS",
+            "client_payload": {
+                "call_sid": call_mcoas.sid
+            }
+        }
+
+        requests.post(GITHUB_DISPATCH_URL, json=payload_mcoas, headers=headers)
+    else:
+        logging.info("Weekend detected — skipping MCOAS call")
+
+    return {"status": "calls initiated"}, 200
 
 # =========================
-# TwiML: Record Once
+# TwiML: Record ONCE
 # =========================
 
 @app.route("/twiml/record", methods=["POST"])
 def twiml_record():
     response = VoiceResponse()
-
     response.record(
         maxLength=40,
         playBeep=False,
@@ -88,12 +118,7 @@ def twiml_record():
         recordingStatusCallbackMethod="POST",
         action=f"{request.url_root}twiml/end"
     )
-
     return Response(str(response), mimetype="text/xml")
-
-# =========================
-# TwiML End
-# =========================
 
 @app.route("/twiml/end", methods=["POST"])
 def twiml_end():
@@ -109,17 +134,6 @@ def twiml_end():
 def recording_complete():
     recording_url = request.form.get("RecordingUrl")
     call_sid = request.form.get("CallSid")
-    center = request.args.get("center", "AL_HSV_MUNICIPAL")
-
-    logging.info(f"Recording completed for {center}")
-    logging.info(f"Call SID: {call_sid}")
-    logging.info(f"Recording URL: {recording_url}")
-
-    # Determine event type
-    if center == "AL_HSV_MCOAS":
-        event_type = "twilio-recording-AL_HSV_MCOAS"
-    else:
-        event_type = "twilio-recording"
 
     headers = {
         "Authorization": f"token {GH_ACTIONS_TOKEN}",
@@ -127,21 +141,20 @@ def recording_complete():
     }
 
     payload = {
-        "event_type": event_type,
+        "event_type": "twilio-recording",
         "client_payload": {
             "recording_url": recording_url,
-            "call_sid": call_sid,
-            "testing_center": center
+            "call_sid": call_sid
         }
     }
 
     r = requests.post(GITHUB_DISPATCH_URL, json=payload, headers=headers)
-    logging.info(f"GitHub dispatch ({event_type}) response: {r.status_code}")
+    logging.info(f"Recording dispatch status: {r.status_code}")
 
     return "", 200
 
 # =========================
-# Run App
+# Run
 # =========================
 
 if __name__ == "__main__":
