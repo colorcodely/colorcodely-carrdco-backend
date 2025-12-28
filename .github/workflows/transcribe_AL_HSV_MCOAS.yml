@@ -1,0 +1,54 @@
+name: Transcribe – AL_HSV_MCOAS
+
+on:
+  schedule:
+    # Monday–Friday at 6:07 AM CST (12:07 UTC)
+    - cron: "7 12 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  transcribe-mcoas:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run transcription for MCOAS
+        env:
+          # --- OpenAI ---
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+          # --- Twilio ---
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_RECORDING_URL: https://api.twilio.com/2010-04-01/Accounts/${{ secrets.TWILIO_ACCOUNT_SID }}/Calls/RECORDING_PLACEHOLDER/Recordings
+
+          # --- Google Sheets ---
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+
+          # --- Email ---
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM_EMAIL: ${{ secrets.SMTP_FROM_EMAIL }}
+          SMTP_FROM_NAME: ${{ secrets.SMTP_FROM_NAME }}
+
+          # --- Routing ---
+          TESTING_CENTER: AL_HSV_MCOAS
+          TARGET_SHEET: MCOAS_DailyTranscriptions
+          RECORDED_LINE: "256-533-8943"
+
+        run: |
+          python scripts/transcribe_and_log.py
