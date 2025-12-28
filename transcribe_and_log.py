@@ -33,8 +33,6 @@ SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
 SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
 SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 
-# Optional: if you add this secret later, we'll use it for the visible "To" line.
-# Otherwise we default to SMTP_FROM_EMAIL.
 PUBLIC_TO_EMAIL = os.environ.get("PUBLIC_TO_EMAIL", SMTP_FROM_EMAIL)
 
 # =========================
@@ -54,9 +52,6 @@ CENTER_CONFIG = {
     },
 }
 
-if TESTING_CENTER not in CENTER_CONFIG:
-    raise ValueError(f"Unknown TESTING_CENTER: {TESTING_CENTER}")
-
 cfg = CENTER_CONFIG[TESTING_CENTER]
 
 # =========================
@@ -66,22 +61,69 @@ cfg = CENTER_CONFIG[TESTING_CENTER]
 def clean_transcription(text: str) -> str:
     text = text.lower().strip()
 
-    fixes = {
-        "color coat": "color code",
+    # Fix common Whisper mishearings
+    replacements = {
         "color gold": "color code",
         "color goal": "color code",
+        "color-goal": "color code",
+        "color-gold": "color code",
+        "color coat": "color code",
         "drug street": "drug screen",
     }
-    for bad, good in fixes.items():
+
+    for bad, good in replacements.items():
         text = text.replace(bad, good)
 
-    # Basic cleanup
-    text = text.strip()
-    if text and not text.endswith("."):
+    # Stop at official end phrase if present
+    stop_phrase = "you must report to drug screen."
+    if stop_phrase in text:
+        text = text.split(stop_phrase)[0] + stop_phrase
+
+    # Split into sentences and deduplicate
+    sentences = []
+    seen = set()
+
+    for s in text.split("."):
+        s = s.strip()
+        if not s:
+            continue
+        s_cap = s.capitalize()
+        if s_cap not in seen:
+            sentences.append(s_cap)
+            seen.add(s_cap)
+
+    text = ". ".join(sentences)
+    if not text.endswith("."):
         text += "."
 
-    # Capitalize first letter
-    return text[:1].upper() + text[1:] if text else text
+    # Capitalize proper nouns
+    proper_replacements = {
+        "city of huntsville": "City of Huntsville",
+        "huntsville": "Huntsville",
+        "madison county": "Madison County",
+    }
+
+    for bad, good in proper_replacements.items():
+        text = text.replace(bad, good)
+
+    # Capitalize days and months
+    days = [
+        "Monday", "Tuesday", "Wednesday",
+        "Thursday", "Friday", "Saturday", "Sunday"
+    ]
+    months = [
+        "January", "February", "March", "April",
+        "May", "June", "July", "August",
+        "September", "October", "November", "December"
+    ]
+
+    for d in days:
+        text = text.replace(d.lower(), d)
+
+    for m in months:
+        text = text.replace(m.lower(), m)
+
+    return text.strip()
 
 # =========================
 # Download Twilio Recording
@@ -115,7 +157,9 @@ text = clean_transcription(raw_text)
 # Time (CST/CDT safe)
 # =========================
 
-now = datetime.now(tz=ZoneInfo("UTC")).astimezone(ZoneInfo("America/Chicago"))
+now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
+    ZoneInfo("America/Chicago")
+)
 
 # =========================
 # Google Sheets
@@ -129,52 +173,48 @@ creds = service_account.Credentials.from_service_account_info(
 service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
 
-row = [
-    now.strftime("%Y-%m-%d"),
-    now.strftime("%H:%M:%S"),
-    "",
-    "",
-    "",
-    text,
-]
-
 sheet.values().append(
     spreadsheetId=GOOGLE_SHEET_ID,
     range=f"{cfg['sheet']}!A:F",
     valueInputOption="RAW",
-    body={"values": [row]},
+    body={"values": [[
+        now.strftime("%Y-%m-%d"),
+        now.strftime("%H:%M:%S"),
+        "",
+        "",
+        "",
+        text,
+    ]]},
 ).execute()
 
 # =========================
-# Active Subscribers (filtered by testing center)
+# Subscribers filtered by center
 # =========================
 
-result = sheet.values().get(
+rows = sheet.values().get(
     spreadsheetId=GOOGLE_SHEET_ID,
     range="Subscribers!A2:G",
-).execute()
+).execute().get("values", [])
 
-rows = result.get("values", [])
-
-active_emails = []
-for r in rows:
-    # Expected columns:
-    # A full_name, B email, C cell_number, D testing_center, E active, F created_at, G ...
-    if len(r) < 5:
-        continue
-    email = (r[1] or "").strip()
-    center = (r[3] or "").strip()
-    active = (r[4] or "").strip().upper()
-
-    if email and active == "YES" and center == TESTING_CENTER:
-        active_emails.append(email)
+emails = [
+    r[1].strip()
+    for r in rows
+    if len(r) >= 5
+    and r[1].strip()
+    and r[3].strip() == TESTING_CENTER
+    and r[4].strip().upper() == "YES"
+]
 
 # =========================
-# Email Notification (BCC)
+# Email (BCC-safe)
 # =========================
 
-if active_emails:
-    subject = "📣 Daily Color Code Announcement - Powered by ColorCodely!"
+if emails:
+    msg = MIMEMultipart()
+    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+    msg["To"] = PUBLIC_TO_EMAIL
+    msg["Bcc"] = ", ".join(emails)
+    msg["Subject"] = "📣 Daily Color Code Announcement - Powered by ColorCodely!"
 
     body = f"""📣 Daily Color Code Announcement - Powered by ColorCodely!
 
@@ -190,30 +230,11 @@ if active_emails:
 👍 Stay accountable, stay informed, and good luck on your journey!
 
 You are receiving this email because you subscribed to ColorCodely alerts.
-
-ColorCodely
-📧 colorcodely@gmail.com
-🌐 https://colorcodely.carrd.co
-🚀 Huntsville, AL
 """
 
-    msg = MIMEMultipart()
-    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-
-    # Show only a single public address in the email header:
-    msg["To"] = PUBLIC_TO_EMAIL
-
-    # Put all recipients in BCC (hidden)
-    msg["Bcc"] = ", ".join(active_emails)
-
-    msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
-
-    # IMPORTANT: pass the actual recipients list to sendmail
-    # so all BCC recipients receive the email.
-    recipients = [PUBLIC_TO_EMAIL] + active_emails
 
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.sendmail(SMTP_FROM_EMAIL, recipients, msg.as_string())
+        server.sendmail(SMTP_FROM_EMAIL, [PUBLIC_TO_EMAIL] + emails, msg.as_string())
