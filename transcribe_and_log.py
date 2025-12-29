@@ -33,8 +33,6 @@ SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
 SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
 SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 
-PUBLIC_TO_EMAIL = os.environ.get("PUBLIC_TO_EMAIL", SMTP_FROM_EMAIL)
-
 # =========================
 # Center Config
 # =========================
@@ -52,6 +50,9 @@ CENTER_CONFIG = {
     },
 }
 
+if TESTING_CENTER not in CENTER_CONFIG:
+    raise RuntimeError(f"Unknown TESTING_CENTER: {TESTING_CENTER}")
+
 cfg = CENTER_CONFIG[TESTING_CENTER]
 
 # =========================
@@ -61,7 +62,6 @@ cfg = CENTER_CONFIG[TESTING_CENTER]
 def clean_transcription(text: str) -> str:
     text = text.lower().strip()
 
-    # Fix common Whisper mishearings
     replacements = {
         "color gold": "color code",
         "color goal": "color code",
@@ -74,12 +74,10 @@ def clean_transcription(text: str) -> str:
     for bad, good in replacements.items():
         text = text.replace(bad, good)
 
-    # Stop at official end phrase if present
     stop_phrase = "you must report to drug screen."
     if stop_phrase in text:
         text = text.split(stop_phrase)[0] + stop_phrase
 
-    # Split into sentences and deduplicate
     sentences = []
     seen = set()
 
@@ -96,7 +94,6 @@ def clean_transcription(text: str) -> str:
     if not text.endswith("."):
         text += "."
 
-    # Capitalize proper nouns
     proper_replacements = {
         "city of huntsville": "City of Huntsville",
         "huntsville": "Huntsville",
@@ -106,7 +103,6 @@ def clean_transcription(text: str) -> str:
     for bad, good in proper_replacements.items():
         text = text.replace(bad, good)
 
-    # Capitalize days and months
     days = [
         "Monday", "Tuesday", "Wednesday",
         "Thursday", "Friday", "Saturday", "Sunday"
@@ -188,7 +184,7 @@ sheet.values().append(
 ).execute()
 
 # =========================
-# Subscribers filtered by center
+# Subscribers filtered by center (STRICT)
 # =========================
 
 rows = sheet.values().get(
@@ -205,18 +201,22 @@ emails = [
     and r[4].strip().upper() == "YES"
 ]
 
+if not emails:
+    raise RuntimeError(
+        f"No active subscribers found for testing center: {TESTING_CENTER}"
+    )
+
 # =========================
-# Email (BCC-safe)
+# Email (BCC-only, center-safe)
 # =========================
 
-if emails:
-    msg = MIMEMultipart()
-    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    msg["To"] = PUBLIC_TO_EMAIL
-    msg["Bcc"] = ", ".join(emails)
-    msg["Subject"] = "📣 Daily Color Code Announcement - Powered by ColorCodely!"
+msg = MIMEMultipart()
+msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+msg["To"] = SMTP_FROM_EMAIL
+msg["Bcc"] = ", ".join(emails)
+msg["Subject"] = "📣 Daily Color Code Announcement - Powered by ColorCodely!"
 
-    body = f"""📣 Daily Color Code Announcement - Powered by ColorCodely!
+body = f"""📣 Daily Color Code Announcement - Powered by ColorCodely!
 
 🏛️ TESTING LOCATION: {cfg['location']}
 ☎️ RECORDED LINE: {cfg['phone']}
@@ -232,9 +232,13 @@ if emails:
 You are receiving this email because you subscribed to ColorCodely alerts.
 """
 
-    msg.attach(MIMEText(body, "plain"))
+msg.attach(MIMEText(body, "plain"))
 
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.sendmail(SMTP_FROM_EMAIL, [PUBLIC_TO_EMAIL] + emails, msg.as_string())
+with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+    server.starttls()
+    server.login(SMTP_USERNAME, SMTP_PASSWORD)
+    server.sendmail(
+        SMTP_FROM_EMAIL,
+        [SMTP_FROM_EMAIL] + emails,
+        msg.as_string(),
+    )
