@@ -1,4 +1,4 @@
-name: Transcribe Twilio Recording
+name: Transcribe Twilio Recording (HSV Municipal Court)
 
 on:
   repository_dispatch:
@@ -28,8 +28,8 @@ jobs:
       SMTP_FROM_EMAIL: ${{ secrets.SMTP_FROM_EMAIL }}
       SMTP_FROM_NAME: ${{ secrets.SMTP_FROM_NAME }}
 
-      # IMPORTANT: which testing center this recording belongs to
-      TESTING_CENTER: ${{ github.event.client_payload.testing_center }}
+      # Public "To" placeholder (BCC-safe)
+      PUBLIC_TO_EMAIL: ${{ secrets.PUBLIC_TO_EMAIL }}
 
     steps:
       - name: Checkout repository
@@ -44,6 +44,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Inject testing center
+        run: |
+          echo "TESTING_CENTER=AL_HSV_Municipal_Court" >> $GITHUB_ENV
 
       - name: Inject Twilio recording URL
         run: |
