@@ -5,39 +5,22 @@ on:
     types: [twilio-recording]
 
 jobs:
-  transcribe-hsv:
+  transcribe:
     runs-on: ubuntu-latest
 
     env:
-      # ------------------------
-      # Testing Center Identity
-      # ------------------------
-      # MUST match:
-      # - Subscriber sheet `testing_center`
-      # - Twilio callback route
-      # - Google Sheet tab mapping
-      TESTING_CENTER: AL_HSV_Municipal_Court
-
-      # ------------------------
       # OpenAI
-      # ------------------------
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-      # ------------------------
       # Google Sheets
-      # ------------------------
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
 
-      # ------------------------
       # Twilio
-      # ------------------------
       TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
       TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
 
-      # ------------------------
       # Email / SMTP
-      # ------------------------
       SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
       SMTP_PORT: ${{ secrets.SMTP_PORT }}
       SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
@@ -45,11 +28,8 @@ jobs:
       SMTP_FROM_EMAIL: ${{ secrets.SMTP_FROM_EMAIL }}
       SMTP_FROM_NAME: ${{ secrets.SMTP_FROM_NAME }}
 
-      # ------------------------
-      # Notification Handling
-      # ------------------------
-      # Used internally for dispatch logic
-      NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+      # IMPORTANT: which testing center this recording belongs to
+      TESTING_CENTER: ${{ github.event.client_payload.testing_center }}
 
     steps:
       - name: Checkout repository
