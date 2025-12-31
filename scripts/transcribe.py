@@ -1,68 +1,58 @@
-import os
-import requests
-import tempfile
-from openai import OpenAI
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+name: Transcribe Twilio Recording (HSV Municipal Court)
 
-RECORDING_URL = os.environ["RECORDING_URL"]
-TWILIO_SID = os.environ["TWILIO_SID"]
-TWILIO_AUTH = os.environ["TWILIO_AUTH"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL")
+on:
+  repository_dispatch:
+    types: [twilio-recording]
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
 
-print(f"Downloading recording: {RECORDING_URL}")
+    env:
+      # OpenAI
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-auth = (TWILIO_SID, TWILIO_AUTH)
-response = requests.get(f"{RECORDING_URL}.wav", auth=auth)
-response.raise_for_status()
+      # Google Sheets
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
 
-with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-    f.write(response.content)
-    audio_path = f.name
+      # Twilio
+      TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+      TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
 
-with open(audio_path, "rb") as audio_file:
-    transcript = client.audio.transcriptions.create(
-        file=audio_file,
-        model="gpt-4o-transcribe"
-    )
+      # Email / SMTP
+      SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      SMTP_FROM_EMAIL: ${{ secrets.SMTP_FROM_EMAIL }}
+      SMTP_FROM_NAME: ${{ secrets.SMTP_FROM_NAME }}
 
-text = transcript.text
-print("Transcription complete")
+      # Public "To" placeholder (BCC-safe)
+      PUBLIC_TO_EMAIL: ${{ secrets.PUBLIC_TO_EMAIL }}
 
-# --- Google Sheets ---
-creds = service_account.Credentials.from_service_account_file(
-    "google_service_account.json",
-    scopes=["https://www.googleapis.com/auth/spreadsheets"]
-)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-service = build("sheets", "v4", credentials=creds)
-sheet = service.spreadsheets()
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-sheet.values().append(
-    spreadsheetId=GOOGLE_SHEET_ID,
-    range="Sheet1!A:B",
-    valueInputOption="RAW",
-    body={"values": [[text]]}
-).execute()
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-print("Google Sheet updated")
+      - name: Inject testing center
+        run: |
+          echo "TESTING_CENTER=AL_HSV_Municipal_Court" >> $GITHUB_ENV
 
-# --- Optional Email ---
-if NOTIFY_EMAIL:
-    import smtplib
-    from email.message import EmailMessage
+      - name: Inject Twilio recording URL
+        run: |
+          echo "TWILIO_RECORDING_URL=${{ github.event.client_payload.recording_url }}" >> $GITHUB_ENV
 
-    msg = EmailMessage()
-    msg.set_content(text)
-    msg["Subject"] = "Daily Call Transcription"
-    msg["From"] = NOTIFY_EMAIL
-    msg["To"] = NOTIFY_EMAIL
-
-    with smtplib.SMTP("localhost") as s:
-        s.send_message(msg)
-
-    print("Notification email sent")
+      - name: Run transcription + logging
+        run: |
+          python transcribe_and_log.py
