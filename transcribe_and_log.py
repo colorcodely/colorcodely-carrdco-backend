@@ -12,11 +12,10 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 # =========================
-# Environment Variables
+# ENV
 # =========================
 
 openai.api_key = os.environ["OPENAI_API_KEY"]
-
 TESTING_CENTER = os.environ["TESTING_CENTER"]
 
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
@@ -33,8 +32,10 @@ SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
 SMTP_FROM_EMAIL = os.environ["SMTP_FROM_EMAIL"]
 SMTP_FROM_NAME = os.environ["SMTP_FROM_NAME"]
 
+PUBLIC_TO_EMAIL = SMTP_FROM_EMAIL
+
 # =========================
-# Center Config
+# CENTER CONFIG
 # =========================
 
 CENTER_CONFIG = {
@@ -48,15 +49,17 @@ CENTER_CONFIG = {
         "phone": "256-533-8943",
         "sheet": "MCOAS_DailyTranscriptions",
     },
+    "AL_MORGANCOUNTY": {
+        "location": "Morgan County Court Referral Office",
+        "phone": "256-560-6042",
+        "sheet": "AL_MorganCounty_DailyTranscriptions",
+    },
 }
-
-if TESTING_CENTER not in CENTER_CONFIG:
-    raise RuntimeError(f"Unknown TESTING_CENTER: {TESTING_CENTER}")
 
 cfg = CENTER_CONFIG[TESTING_CENTER]
 
 # =========================
-# Helper: transcription cleanup
+# CLEAN TRANSCRIPTION
 # =========================
 
 def clean_transcription(text: str) -> str:
@@ -65,8 +68,6 @@ def clean_transcription(text: str) -> str:
     replacements = {
         "color gold": "color code",
         "color goal": "color code",
-        "color-goal": "color code",
-        "color-gold": "color code",
         "color coat": "color code",
         "drug street": "drug screen",
     }
@@ -78,79 +79,53 @@ def clean_transcription(text: str) -> str:
     if stop_phrase in text:
         text = text.split(stop_phrase)[0] + stop_phrase
 
-    sentences = []
-    seen = set()
-
+    sentences, seen = [], set()
     for s in text.split("."):
         s = s.strip()
         if not s:
             continue
-        s_cap = s.capitalize()
-        if s_cap not in seen:
-            sentences.append(s_cap)
-            seen.add(s_cap)
+        s = s.capitalize()
+        if s not in seen:
+            sentences.append(s)
+            seen.add(s)
 
     text = ". ".join(sentences)
     if not text.endswith("."):
         text += "."
 
-    proper_replacements = {
-        "city of huntsville": "City of Huntsville",
-        "huntsville": "Huntsville",
-        "madison county": "Madison County",
-    }
-
-    for bad, good in proper_replacements.items():
-        text = text.replace(bad, good)
-
-    days = [
-        "Monday", "Tuesday", "Wednesday",
-        "Thursday", "Friday", "Saturday", "Sunday"
-    ]
-    months = [
-        "January", "February", "March", "April",
-        "May", "June", "July", "August",
-        "September", "October", "November", "December"
-    ]
-
-    for d in days:
+    for d in ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]:
         text = text.replace(d.lower(), d)
-
-    for m in months:
+    for m in ["January","February","March","April","May","June","July","August","September","October","November","December"]:
         text = text.replace(m.lower(), m)
 
-    return text.strip()
+    return text
 
 # =========================
-# Download Twilio Recording
+# DOWNLOAD RECORDING
 # =========================
 
-response = requests.get(
+resp = requests.get(
     f"{TWILIO_RECORDING_URL}.wav",
     auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
     timeout=30,
 )
-response.raise_for_status()
+resp.raise_for_status()
 
 with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-    f.write(response.content)
+    f.write(resp.content)
     audio_path = f.name
 
 # =========================
-# Transcribe with Whisper
+# TRANSCRIBE
 # =========================
 
-with open(audio_path, "rb") as audio_file:
-    transcription = openai.Audio.transcribe(
-        model="whisper-1",
-        file=audio_file,
-    )
+with open(audio_path, "rb") as audio:
+    result = openai.Audio.transcribe("whisper-1", audio)
 
-raw_text = transcription["text"]
-text = clean_transcription(raw_text)
+text = clean_transcription(result["text"])
 
 # =========================
-# Time (CST/CDT safe)
+# TIME
 # =========================
 
 now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
@@ -158,7 +133,7 @@ now = datetime.now(tz=ZoneInfo("UTC")).astimezone(
 )
 
 # =========================
-# Google Sheets
+# SHEETS
 # =========================
 
 creds = service_account.Credentials.from_service_account_info(
@@ -176,15 +151,12 @@ sheet.values().append(
     body={"values": [[
         now.strftime("%Y-%m-%d"),
         now.strftime("%H:%M:%S"),
-        "",
-        "",
-        "",
-        text,
+        "", "", "", text
     ]]},
 ).execute()
 
 # =========================
-# Subscribers filtered by center (STRICT)
+# SUBSCRIBERS
 # =========================
 
 rows = sheet.values().get(
@@ -201,22 +173,18 @@ emails = [
     and r[4].strip().upper() == "YES"
 ]
 
-if not emails:
-    raise RuntimeError(
-        f"No active subscribers found for testing center: {TESTING_CENTER}"
-    )
-
 # =========================
-# Email (BCC-only, center-safe)
+# EMAIL (BCC)
 # =========================
 
-msg = MIMEMultipart()
-msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-msg["To"] = SMTP_FROM_EMAIL
-msg["Bcc"] = ", ".join(emails)
-msg["Subject"] = "📣 Daily Color Code Announcement - Powered by ColorCodely!"
+if emails:
+    msg = MIMEMultipart()
+    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+    msg["To"] = PUBLIC_TO_EMAIL
+    msg["Bcc"] = ", ".join(emails)
+    msg["Subject"] = "📣 Daily Color Code Announcement - Powered by ColorCodely!"
 
-body = f"""📣 Daily Color Code Announcement - Powered by ColorCodely!
+    body = f"""📣 Daily Color Code Announcement - Powered by ColorCodely!
 
 🏛️ TESTING LOCATION: {cfg['location']}
 ☎️ RECORDED LINE: {cfg['phone']}
@@ -232,13 +200,13 @@ body = f"""📣 Daily Color Code Announcement - Powered by ColorCodely!
 You are receiving this email because you subscribed to ColorCodely alerts.
 """
 
-msg.attach(MIMEText(body, "plain"))
+    msg.attach(MIMEText(body, "plain"))
 
-with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-    server.starttls()
-    server.login(SMTP_USERNAME, SMTP_PASSWORD)
-    server.sendmail(
-        SMTP_FROM_EMAIL,
-        [SMTP_FROM_EMAIL] + emails,
-        msg.as_string(),
-    )
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.sendmail(
+            SMTP_FROM_EMAIL,
+            [PUBLIC_TO_EMAIL] + emails,
+            msg.as_string()
+        )
