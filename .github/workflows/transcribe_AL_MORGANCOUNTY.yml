@@ -1,26 +1,22 @@
-name: Transcribe Twilio Recording (Morgan County)
+name: Transcribe Twilio Recording - AL_MORGANCOUNTY
 
 on:
   repository_dispatch:
     types: [twilio-recording]
 
 jobs:
-  transcribe-morgancounty:
+  transcribe:
+    if: github.event.client_payload.testing_center == 'AL_MORGANCOUNTY'
     runs-on: ubuntu-latest
 
     env:
-      # OpenAI
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
-      # Google Sheets
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
 
-      # Twilio
       TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
       TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
 
-      # Email / SMTP
       SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
       SMTP_PORT: ${{ secrets.SMTP_PORT }}
       SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
@@ -28,30 +24,20 @@ jobs:
       SMTP_FROM_EMAIL: ${{ secrets.SMTP_FROM_EMAIL }}
       SMTP_FROM_NAME: ${{ secrets.SMTP_FROM_NAME }}
 
-      PUBLIC_TO_EMAIL: ${{ secrets.PUBLIC_TO_EMAIL }}
+      TESTING_CENTER: AL_MORGANCOUNTY
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
+      - run: |
           pip install -r requirements.txt
 
-      - name: Inject testing center
-        run: |
-          echo "TESTING_CENTER=AL_MorganCounty_DailyTranscriptions" >> $GITHUB_ENV
-
-      - name: Inject Twilio recording URL
-        run: |
+      - run: |
           echo "TWILIO_RECORDING_URL=${{ github.event.client_payload.recording_url }}" >> $GITHUB_ENV
 
-      - name: Run transcription + logging
-        run: |
+      - run: |
           python transcribe_and_log.py
