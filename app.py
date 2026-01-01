@@ -1,121 +1,146 @@
 import os
 import requests
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 
 # =========================
-# Twilio Credentials
+# Environment Variables
 # =========================
 
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
 
-# =========================
-# GitHub Dispatch
-# =========================
+# IMPORTANT:
+# GitHub token is ONLY required when dispatching workflows
+# Render does NOT provide this automatically
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_REPO = "colorcodely/colorcodely-carrdco-backend"
-GITHUB_EVENT_TYPE = "twilio-recording"
 
 # =========================
-# Testing Center Registry
+# TwiML: Record Call
 # =========================
 
-CENTERS = {
-    "AL_HSV_Municipal_Court": {
-        "to_env": "TWILIO_TO_NUMBER_AL_HSV_MUNICIPAL",
-        "dispatch_workflow": "transcribe.yml",
-    },
-    "AL_HSV_MCOAS": {
-        "to_env": "TWILIO_TO_NUMBER_AL_MCOAS",
-        "dispatch_workflow": "transcribe_AL_HSV_MCOAS.yml",
-    },
-    "AL_MorganCounty_DailyTranscriptions": {
-        "to_env": "TWILIO_TO_NUMBER_AL_MORGANCOUNTY",
-        "dispatch_workflow": "transcribe_AL_MORGANCOUNTY.yml",
-    },
-}
-
-# =========================
-# Shared Call Logic
-# =========================
-
-def place_call(testing_center: str):
-    if testing_center not in CENTERS:
-        return {"error": "Unknown testing center"}, 400
-
-    center = CENTERS[testing_center]
-    to_number = os.environ.get(center["to_env"])
-
-    if not to_number:
-        return {"error": f"Missing env var: {center['to_env']}"}, 500
-
-    twiml_url = (
+@app.route("/twiml/record/<testing_center>", methods=["POST"])
+def record_call(testing_center):
+    recording_callback = (
         f"https://colorcodely-carrdco-backend.onrender.com"
-        f"/twiml/record/{testing_center}"
+        f"/twilio/recording-complete/{testing_center}"
     )
 
-    response = requests.post(
-        f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json",
-        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-        data={
-            "To": to_number,
-            "From": TWILIO_FROM_NUMBER,
-            "Url": twiml_url,
-            "Timeout": 45,
-            "Trim": "trim-silence",
-        },
-        timeout=30,
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Record
+    action="/twiml/end"
+    maxLength="40"
+    playBeep="false"
+    trim="trim-silence"
+    recordingStatusCallback="{recording_callback}"
+    recordingStatusCallbackMethod="POST"
+  />
+</Response>
+"""
+    return Response(xml, mimetype="text/xml")
+
+
+@app.route("/twiml/end", methods=["POST"])
+def end_call():
+    return Response(
+        '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>',
+        mimetype="text/xml",
     )
 
-    response.raise_for_status()
-    call_sid = response.json()["sid"]
+# =========================
+# Twilio → GitHub Dispatch
+# =========================
 
-    # Fire GitHub dispatch so the recording can be transcribed later
-    dispatch_payload = {
-        "event_type": GITHUB_EVENT_TYPE,
-        "client_payload": {
-            "testing_center": testing_center,
-        },
+@app.route("/twilio/recording-complete/<testing_center>", methods=["POST"])
+def recording_complete(testing_center):
+    if not GITHUB_TOKEN:
+        return jsonify({
+            "error": "GITHUB_TOKEN not configured on this service"
+        }), 500
+
+    recording_url = request.form.get("RecordingUrl")
+    if not recording_url:
+        return jsonify({"error": "Missing RecordingUrl"}), 400
+
+    workflow_map = {
+        "AL_HSV_Municipal_Court": "transcribe.yml",
+        "AL_HSV_MCOAS": "transcribe_AL_HSV_MCOAS.yml",
+        "AL_MorganCounty_DailyTranscriptions": "transcribe_AL_MORGANCOUNTY.yml",
     }
 
-    dispatch_headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
+    workflow = workflow_map.get(testing_center)
+    if not workflow:
+        return jsonify({"error": "Unknown testing center"}), 400
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
     }
 
-    requests.post(
-        f"https://api.github.com/repos/{GITHUB_REPO}/dispatches",
-        json=dispatch_payload,
-        headers=dispatch_headers,
-        timeout=15,
-    )
+    payload = {
+        "event_type": "twilio-recording",
+        "client_payload": {
+            "recording_url": recording_url,
+        },
+    }
 
-    return {"call_sid": call_sid}, 200
+    resp = requests.post(url, headers=headers, json=payload, timeout=15)
+
+    if resp.status_code != 204:
+        return jsonify({
+            "error": "GitHub dispatch failed",
+            "status": resp.status_code,
+            "body": resp.text,
+        }), 500
+
+    return jsonify({"status": "workflow dispatched"}), 200
 
 # =========================
-# Routes (Explicit = Safe)
+# Daily Call Triggers
 # =========================
 
 @app.route("/daily-call", methods=["POST"])
 def daily_call_hsv():
-    return jsonify(*place_call("AL_HSV_Municipal_Court"))
+    return _make_daily_call(
+        os.environ["TWILIO_TO_NUMBER"],
+        "AL_HSV_Municipal_Court"
+    )
 
 @app.route("/daily-call/al-hsv-mcoas", methods=["POST"])
 def daily_call_mcoas():
-    return jsonify(*place_call("AL_HSV_MCOAS"))
+    return _make_daily_call(
+        os.environ["TWILIO_TO_NUMBER_MCOAS"],
+        "AL_HSV_MCOAS"
+    )
 
 @app.route("/daily-call/al-morgancounty", methods=["POST"])
-def daily_call_morgancounty():
-    return jsonify(*place_call("AL_MorganCounty_DailyTranscriptions"))
+def daily_call_morgan():
+    return _make_daily_call(
+        os.environ["TWILIO_TO_NUMBER_AL_MORGANCOUNTY"],
+        "AL_MorganCounty_DailyTranscriptions"
+    )
 
 # =========================
-# Health Check
+# Call Helper
 # =========================
 
-@app.route("/", methods=["GET"])
-def health():
-    return "ColorCodely backend running", 200
+def _make_daily_call(to_number, testing_center):
+    from twilio.rest import Client
+
+    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+    call = client.calls.create(
+        to=to_number,
+        from_=os.environ["TWILIO_FROM_NUMBER"],
+        url=f"https://colorcodely-carrdco-backend.onrender.com/twiml/record/{testing_center}",
+        timeout=45,
+        trim="trim-silence",
+    )
+
+    return jsonify({"call_sid": call.sid})
