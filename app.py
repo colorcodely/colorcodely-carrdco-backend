@@ -5,12 +5,16 @@ from flask import Flask, request, Response, abort
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 
-# ======================================================
+# =========================
 # App setup
-# ======================================================
+# =========================
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# =========================
+# Required Environment Vars
+# =========================
 
 def require_env(name: str) -> str:
     value = os.environ.get(name)
@@ -18,51 +22,71 @@ def require_env(name: str) -> str:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
 
-# ======================================================
-# Environment
-# ======================================================
-
+# Twilio
 TWILIO_ACCOUNT_SID = require_env("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = require_env("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = require_env("TWILIO_FROM_NUMBER")
 
+# GitHub (repository dispatch token)
 GH_ACTIONS_TOKEN = require_env("GH_ACTIONS_TOKEN")
-GITHUB_REPO = require_env("GITHUB_REPO")
+GITHUB_REPO = require_env("GITHUB_REPO")  # e.g. colorcodely/colorcodely-carrdco-backend
 
 GITHUB_DISPATCH_URL = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# ======================================================
-# Testing Center Registry (SINGLE SOURCE OF TRUTH)
-# ======================================================
+# =========================
+# Testing Center Registry
+# =========================
+# IMPORTANT:
+# - Keys here must match the URL slug used in /daily-call/<center>
+# - We support aliases to avoid breaking old cron jobs.
 
 TESTING_CENTERS = {
-    "al-hsv-municipal-court": {
-        "env_number": "TWILIO_TO_NUMBER_AL_HSV_MUNICIPAL",
+    # City of Huntsville Municipal Court (aliases)
+    "al-hsv-municipal": {
+        "env_number": "TWILIO_TO_NUMBER",
         "testing_center": "AL_HSV_Municipal_Court",
     },
+    "al-hsv-municipal-court": {
+        "env_number": "TWILIO_TO_NUMBER",
+        "testing_center": "AL_HSV_Municipal_Court",
+    },
+
+    # Madison County Office of Alternative Sentencing
     "al-hsv-mcoas": {
         "env_number": "TWILIO_TO_NUMBER_AL_HSV_MCOAS",
         "testing_center": "AL_HSV_MCOAS",
     },
+
+    # Morgan County Court Referral Office
     "al-morgancounty": {
         "env_number": "TWILIO_TO_NUMBER_AL_MORGANCOUNTY",
         "testing_center": "AL_MORGANCOUNTY",
     },
 }
 
-# ======================================================
-# Health
-# ======================================================
+# =========================
+# Health check
+# =========================
 
 @app.route("/", methods=["GET", "HEAD"])
 def health():
     return "OK", 200
 
-# ======================================================
-# Trigger Daily Call
-# ======================================================
+# =========================
+# Trigger Daily Call (default -> Huntsville Municipal)
+# =========================
+
+@app.route("/daily-call", methods=["POST"])
+def daily_call_default():
+    # Keep backwards compatibility with your original endpoint:
+    # /daily-call -> Huntsville Municipal Court
+    return daily_call("al-hsv-municipal")
+
+# =========================
+# Trigger Daily Call (by center slug)
+# =========================
 
 @app.route("/daily-call/<center>", methods=["POST"])
 def daily_call(center):
@@ -83,21 +107,21 @@ def daily_call(center):
         timeout=45,
     )
 
-    logging.info(f"[{center}] Call started → {call.sid}")
+    logging.info(f"[{center}] Call started: {call.sid}")
     return {"call_sid": call.sid}, 200
 
-# ======================================================
+# =========================
 # TwiML: Record
-# ======================================================
+# =========================
 
 @app.route("/twiml/record/<center>", methods=["POST"])
 def twiml_record(center):
     if center not in TESTING_CENTERS:
-        abort(404)
+        abort(404, f"Unknown testing center: {center}")
 
     response = VoiceResponse()
     response.record(
-        maxLength=45,
+        maxLength=40,
         playBeep=False,
         trim="trim-silence",
         recordingStatusCallback=f"{request.url_root}twilio/recording-complete/{center}",
@@ -107,9 +131,9 @@ def twiml_record(center):
 
     return Response(str(response), mimetype="text/xml")
 
-# ======================================================
+# =========================
 # TwiML End
-# ======================================================
+# =========================
 
 @app.route("/twiml/end", methods=["POST"])
 def twiml_end():
@@ -117,14 +141,14 @@ def twiml_end():
     response.hangup()
     return Response(str(response), mimetype="text/xml")
 
-# ======================================================
+# =========================
 # Recording Complete → GitHub Dispatch
-# ======================================================
+# =========================
 
 @app.route("/twilio/recording-complete/<center>", methods=["POST"])
 def recording_complete(center):
     if center not in TESTING_CENTERS:
-        abort(404)
+        abort(404, f"Unknown testing center: {center}")
 
     recording_url = request.form.get("RecordingUrl")
     call_sid = request.form.get("CallSid")
@@ -132,28 +156,32 @@ def recording_complete(center):
     if not recording_url:
         abort(400, "Missing RecordingUrl")
 
-    payload = {
-        "event_type": "twilio-recording",
-        "client_payload": {
-            "testing_center": TESTING_CENTERS[center]["testing_center"],
-            "recording_url": recording_url,
-            "call_sid": call_sid,
-        },
-    }
+    cfg = TESTING_CENTERS[center]
 
     headers = {
         "Authorization": f"token {GH_ACTIONS_TOKEN}",
         "Accept": "application/vnd.github+json",
     }
 
+    payload = {
+        "event_type": "twilio-recording",
+        "client_payload": {
+            "recording_url": recording_url,
+            "call_sid": call_sid,
+            "testing_center": cfg["testing_center"],
+        },
+    }
+
     r = requests.post(GITHUB_DISPATCH_URL, json=payload, headers=headers)
 
-    logging.info(f"[{center}] GitHub dispatch → {r.status_code}")
+    logging.info(f"[{center}] GitHub dispatch → {r.status_code} {r.text}")
+
+    # Always return 200 to Twilio so it doesn't retry forever.
     return "", 200
 
-# ======================================================
-# Local
-# ======================================================
+# =========================
+# Local run
+# =========================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
