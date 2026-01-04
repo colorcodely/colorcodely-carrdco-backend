@@ -29,8 +29,7 @@ TWILIO_FROM_NUMBER = require_env("TWILIO_FROM_NUMBER")
 
 # GitHub (dispatch token)
 GH_ACTIONS_TOKEN = require_env("GH_ACTIONS_TOKEN")
-GITHUB_REPO = require_env("GITHUB_REPO")  # e.g. colorcodely/colorcodely-carrdco-backend
-
+GITHUB_REPO = require_env("GITHUB_REPO")  # colorcodely/colorcodely-carrdco-backend
 GITHUB_DISPATCH_URL = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -54,6 +53,8 @@ TESTING_CENTERS = {
     },
 }
 
+DEFAULT_CENTER = "al-hsv-municipal-court"
+
 # =========================
 # Health check
 # =========================
@@ -61,6 +62,14 @@ TESTING_CENTERS = {
 @app.route("/", methods=["GET", "HEAD"])
 def health():
     return "OK", 200
+
+# =========================
+# Legacy Huntsville Route
+# =========================
+
+@app.route("/daily-call", methods=["POST"])
+def daily_call_default():
+    return daily_call(DEFAULT_CENTER)
 
 # =========================
 # Trigger Daily Call
@@ -152,9 +161,7 @@ def recording_complete(center):
 
     r = requests.post(GITHUB_DISPATCH_URL, json=payload, headers=headers)
 
-    logging.info(
-        f"[{center}] GitHub dispatch → {r.status_code}"
-    )
+    logging.info(f"[{center}] GitHub dispatch → {r.status_code}")
 
     return "", 200
 
